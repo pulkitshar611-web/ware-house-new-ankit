@@ -52,4 +52,26 @@ async function deductStock(req, res, next) {
   }
 }
 
-module.exports = { list, getById, create, update, deductStock };
+async function prepare(req, res, next) {
+  try {
+    const data = await shipmentService.prepareShipment(req.body, req.user);
+    res.json({ success: true, data });
+  } catch (err) {
+    if (err.message === 'Order not found' || err.message.includes('status')) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+}
+
+async function remove(req, res, next) {
+  try {
+    const data = await shipmentService.remove(req.params.id, req.user);
+    res.json({ success: true, data });
+  } catch (err) {
+    if (err.message === 'Shipment not found') return res.status(404).json({ success: false, message: err.message });
+    next(err);
+  }
+}
+
+module.exports = { list, getById, create, update, deductStock, prepare, remove };

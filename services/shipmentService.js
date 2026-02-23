@@ -200,4 +200,59 @@ async function deductStockForShipment(shipmentId, reqUser) {
   return { message: deducted > 0 ? `Stock deducted for ${deducted} product(s). Refresh Inventory/Products.` : 'No stock records found. Ensure products have inventory (Stock).', deducted };
 }
 
-module.exports = { list, getById, create, update, deductStockForShipment };
+async function prepareShipment(data, reqUser) {
+  const { orderNumber } = data;
+  if (!orderNumber) throw new Error('Order number required');
+
+  const order = await SalesOrder.findOne({
+    where: {
+      orderNumber: orderNumber.trim(),
+      companyId: reqUser.companyId || { [Op.ne]: null }
+    },
+    include: ['Shipment']
+  });
+
+  if (!order) throw new Error('Order not found');
+  if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
+
+  // If shipment doesn't exist, create it (assuming it's PACKED)
+  let shipment = order.Shipment;
+  if (!shipment) {
+    if (order.status !== 'PACKED' && order.status !== 'PICKED') {
+      throw new Error(`Order ${orderNumber} is in status ${order.status}. It must be PACKED or PICKED to ship.`);
+    }
+    shipment = await create({ salesOrderId: order.id }, reqUser);
+  }
+
+  // Update status to SHIPPED
+  return update(shipment.id, { deliveryStatus: 'SHIPPED' }, reqUser);
+}
+
+async function remove(id, reqUser) {
+  const shipment = await Shipment.findByPk(id);
+  if (!shipment) throw new Error('Shipment not found');
+  if (reqUser.role !== 'super_admin' && shipment.companyId !== reqUser.companyId) throw new Error('Shipment not found');
+
+  const order = await SalesOrder.findByPk(shipment.salesOrderId);
+
+  // Revert stock if deducted
+  if (shipment.stockDeducted && order) {
+    const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id } });
+    for (const item of orderItems) {
+      const stock = await ProductStock.findOne({ where: { productId: item.productId } });
+      if (stock) {
+        await stock.increment('quantity', { by: item.quantity });
+        await stock.increment('reserved', { by: item.quantity });
+      }
+    }
+  }
+
+  if (order) {
+    await order.update({ status: 'PACKED' });
+  }
+
+  await shipment.destroy();
+  return { message: 'Shipment deleted and order reverted' };
+}
+
+module.exports = { list, getById, create, update, deductStockForShipment, prepareShipment, remove };

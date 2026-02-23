@@ -32,6 +32,7 @@ router.put('/stock/:id', requireRole(...writeRoles), inventoryController.updateS
 router.delete('/stock/:id', requireRole(...writeRoles), inventoryController.removeStock);
 
 // Quick Scan: picker, packer, warehouse_manager bhi adjustments kar sakte hain
+router.delete('/adjustments/:id', requireRole(...scanRoles), inventoryController.removeAdjustment);
 router.get('/adjustments', requireRole(...readRoles), inventoryController.listAdjustments);
 router.post('/adjustments', requireRole(...scanRoles), inventoryController.createAdjustment);
 
@@ -49,6 +50,6 @@ router.get('/movements', requireRole('super_admin', 'company_admin', 'warehouse_
 router.get('/movements/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'viewer'), inventoryController.getMovement);
 router.post('/movements', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), inventoryController.createMovement);
 router.put('/movements/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), inventoryController.updateMovement);
-router.delete('/movements/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), inventoryController.removeMovement);
+router.delete('/movements/:id', requireRole(...scanRoles), inventoryController.removeMovement);
 
 module.exports = router;

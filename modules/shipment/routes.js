@@ -9,6 +9,8 @@ router.get('/', requireRole('super_admin', 'company_admin', 'warehouse_manager',
 router.get('/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer', 'viewer'), shipmentController.getById);
 router.post('/', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.create);
 router.put('/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.update);
+router.delete('/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.remove);
 router.post('/:id/deduct-stock', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.deductStock);
+router.post('/prepare', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.prepare);
 
 module.exports = router;

@@ -93,4 +93,13 @@ async function validateCapacity(warehouseId, incomingQty, options = {}) {
   return true;
 }
 
-module.exports = { list, getById, create, update, remove, validateCapacity };
+async function getDefaultLocation(companyId) {
+  const wh = await Warehouse.findOne({ where: { companyId } });
+  if (!wh) return null;
+  const zone = await Zone.findOne({ where: { warehouseId: wh.id } });
+  if (!zone) return null;
+  const loc = await Location.findOne({ where: { zoneId: zone.id } });
+  return loc;
+}
+
+module.exports = { list, getById, create, update, remove, validateCapacity, getDefaultLocation };

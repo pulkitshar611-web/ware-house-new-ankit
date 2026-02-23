@@ -190,6 +190,17 @@ async function createAdjustment(req, res, next) {
   }
 }
 
+async function removeAdjustment(req, res, next) {
+  try {
+    console.log(`[DEBUG] removeAdjustment ID=${req.params.id} user=${req.user.id}`);
+    const data = await inventoryService.removeAdjustment(req.params.id, req.user);
+    res.json({ success: true, data });
+  } catch (err) {
+    if (err.message === 'Adjustment not found') return res.status(404).json({ success: false, message: err.message });
+    next(err);
+  }
+}
+
 async function listCycleCounts(req, res, next) {
   try {
     const data = await inventoryService.listCycleCounts(req.user, req.query);
@@ -336,6 +347,7 @@ module.exports = {
   listStockByLocation,
   listAdjustments,
   createAdjustment,
+  removeAdjustment,
   listCycleCounts,
   createCycleCount,
   completeCycleCount,

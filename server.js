@@ -13,6 +13,7 @@ const { authenticate, requireSuperAdmin, requireRole } = require('./middlewares/
 const dashboardController = require('./controllers/dashboardController');
 const reportController = require('./controllers/reportController');
 const analyticsController = require('./controllers/analyticsController');
+const shipmentController = require('./controllers/shipmentController');
 const cronService = require('./services/cronService');
 
 const app = express();
@@ -21,6 +22,11 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+app.use((req, res, next) => {
+  console.log(`[DEBUG] ${req.method} ${req.path}`);
+  next();
+});
 
 // Sales orders - register FIRST so DELETE /api/orders/sales/:id never 404s
 const soRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'picker', 'packer', 'viewer'];
@@ -77,9 +83,14 @@ app.post('/api/goods-receiving', authenticate, requireRole(...grWriteRoles), goo
 app.put('/api/goods-receiving/:id/receive', authenticate, requireRole(...grWriteRoles), goodsReceiptController.updateReceived);
 app.delete('/api/goods-receiving/:id', authenticate, requireRole(...grWriteRoles), goodsReceiptController.remove);
 
-// Inventory products - explicit DELETE so /api/inventory/products/:id never 404s
 const invProductRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'];
 app.delete('/api/inventory/products/:id', authenticate, requireRole(...invProductRoles), inventoryController.removeProduct);
+
+// Fast Scan Undo Routes - explicitly in server.js to fix 404 issues
+const scanRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
+app.delete('/api/inventory/adjustments/:id', authenticate, requireRole(...scanRoles), inventoryController.removeAdjustment);
+app.delete('/api/inventory/movements/:id', authenticate, requireRole(...scanRoles), inventoryController.removeMovement);
+app.delete('/api/shipments/:id', authenticate, requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.remove);
 
 // POST /api/products/:id/alternative-skus (same handler as inventory, so client can call either path)
 app.post('/api/products/:id/alternative-skus', authenticate, requireRole(...invProductRoles), inventoryController.addAlternativeSku);
@@ -91,6 +102,11 @@ app.use('/api/returns', returnRoutes);
 app.use('/api/production', authenticate, productionRoutes);
 
 app.use(routes);
+
+app.use((req, res, next) => {
+  console.log(`[404 ERROR] ${req.method} ${req.url}`);
+  res.status(404).json({ success: false, message: `Route not found: ${req.method} ${req.url}` });
+});
 
 app.use((err, req, res, next) => {
   console.error(err);

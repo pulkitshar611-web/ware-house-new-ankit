@@ -1,4 +1,4 @@
-const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement } = require('../models');
+const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement, sequelize } = require('../models');
 const { Op } = require('sequelize');
 
 /** Ensure product JSON fields from API are proper objects/arrays (e.g. SQLite may return strings) */
@@ -354,7 +354,12 @@ async function listStock(reqUser, query = {}) {
   const stocks = await ProductStock.findAll({
     where,
     include: [
-      { association: 'Product', where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined, required: reqUser.role !== 'super_admin' },
+      {
+        association: 'Product',
+        where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined,
+        required: reqUser.role !== 'super_admin',
+        include: [{ association: 'Category', attributes: ['id', 'name'] }]
+      },
       { association: 'Warehouse', include: ['Company'] },
       { association: 'Location', required: false },
     ],
@@ -560,16 +565,24 @@ async function createAdjustment(data, reqUser) {
 
   let productId = data.productId;
   if (!productId && (data.sku || data.barcode)) {
-    const p = await Product.findOne({
-      where: {
-        companyId: companyId,
-        [Op.or]: [
-          { sku: data.sku || '' },
-          { barcode: data.barcode || data.sku || '' }
-        ]
-      }
-    });
-    if (p) productId = p.id;
+    const searchTerm = (data.sku || data.barcode || '').trim();
+    if (searchTerm) {
+      const p = await Product.findOne({
+        where: {
+          companyId: companyId,
+          [Op.or]: [
+            { sku: searchTerm },
+            { barcode: searchTerm },
+            // Search in alternativeSkus JSON if applicable
+            sequelize.where(
+              sequelize.fn('JSON_CONTAINS', sequelize.col('alternative_skus'), JSON.stringify(searchTerm)),
+              1
+            )
+          ]
+        }
+      });
+      if (p) productId = p.id;
+    }
   }
 
   if (!productId) throw new Error('Product not found');
@@ -651,6 +664,31 @@ async function createAdjustment(data, reqUser) {
     delete j.Product;
     return j;
   });
+}
+
+async function removeAdjustment(id, reqUser) {
+  const adj = await InventoryAdjustment.findByPk(id);
+  if (!adj) throw new Error('Adjustment not found');
+  if (reqUser.role !== 'super_admin' && adj.companyId !== reqUser.companyId) throw new Error('Adjustment not found');
+
+  // Revert stock change
+  const stock = await ProductStock.findOne({
+    where: {
+      productId: adj.productId,
+      warehouseId: adj.warehouseId || null
+    }
+  });
+
+  if (stock) {
+    if (adj.type === 'INCREASE') {
+      await stock.decrement('quantity', { by: adj.quantity });
+    } else {
+      await stock.increment('quantity', { by: adj.quantity });
+    }
+  }
+
+  await adj.destroy();
+  return { message: 'Adjustment deleted and stock reverted' };
 }
 
 async function listCycleCounts(reqUser, query = {}) {
@@ -998,16 +1036,39 @@ async function listMovements(reqUser, query = {}) {
     return j;
   });
 }
-
 async function createMovement(data, reqUser) {
   if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'warehouse_manager') {
     throw new Error('Not allowed to create movement');
   }
   const companyId = reqUser.companyId || data.companyId;
   if (!companyId) throw new Error('Company context required');
-  const product = await Product.findByPk(data.productId);
+
+  let productId = data.productId;
+  if (!productId && (data.sku || data.barcode || data.productSku)) {
+    const searchTerm = (data.sku || data.barcode || data.productSku || '').trim();
+    if (searchTerm) {
+      const p = await Product.findOne({
+        where: {
+          companyId: companyId,
+          [Op.or]: [
+            { sku: searchTerm },
+            { barcode: searchTerm },
+            sequelize.where(
+              sequelize.fn('JSON_CONTAINS', sequelize.col('alternative_skus'), JSON.stringify(searchTerm)),
+              1
+            )
+          ]
+        }
+      });
+      if (p) productId = p.id;
+    }
+  }
+
+  if (!productId) throw new Error('Product not found');
+  const product = await Product.findByPk(productId);
   if (!product) throw new Error('Product not found');
   if (product.companyId !== companyId && reqUser.role !== 'super_admin') throw new Error('Product not found');
+
   const qty = parseInt(data.quantity, 10) || 0;
   if (qty <= 0) throw new Error('Quantity must be greater than 0');
 
@@ -1020,6 +1081,42 @@ async function createMovement(data, reqUser) {
     if (b) batchNumber = b.batchNumber;
   }
 
+  let fromLocationId = data.fromLocationId;
+  let toLocationId = data.toLocationId;
+
+  // Lookup locations by name/code if IDs are missing but names are provided
+  if (!fromLocationId && data.fromLocation) {
+    const loc = await (require('../models').Location).findOne({
+      where: {
+        [Op.or]: [{ name: data.fromLocation }, { code: data.fromLocation }],
+        companyId: companyId
+      }
+    });
+    if (loc) fromLocationId = loc.id;
+  }
+  if (!toLocationId && (data.toLocation || data.toLocationId)) {
+    const loc = await (require('../models').Location).findOne({
+      where: {
+        [Op.or]: [{ name: data.toLocation || data.toLocationId }, { code: data.toLocation || data.toLocationId }],
+        companyId: companyId
+      }
+    });
+    if (loc) toLocationId = loc.id;
+  }
+
+  // Fallback to default location if still missing for TRANSFER or RECEIVE
+  if ((type === 'TRANSFER' || type === 'RECEIVE') && !toLocationId) {
+    const warehouseService = require('./warehouseService');
+    const defLoc = await warehouseService.getDefaultLocation(companyId);
+    if (defLoc) toLocationId = defLoc.id;
+  }
+  if ((type === 'TRANSFER' || type === 'PICK') && !fromLocationId) {
+    // For pick/transfer, we might need to find WHERE the product actually is
+    const { ProductStock } = require('../models');
+    const stock = await ProductStock.findOne({ where: { productId: productId }, order: [['quantity', 'DESC']] });
+    if (stock) fromLocationId = stock.locationId;
+  }
+
   const transaction = await sequelize.transaction();
 
   try {
@@ -1027,7 +1124,7 @@ async function createMovement(data, reqUser) {
     const movement = await Movement.create({
       companyId,
       type,
-      productId: data.productId,
+      productId,
       batchId,
       fromLocationId: data.fromLocationId || null,
       toLocationId: data.toLocationId || null,
@@ -1038,19 +1135,6 @@ async function createMovement(data, reqUser) {
     }, { transaction });
 
     // 2. Adjust Stock based on Type
-    /*
-      RECEIVE/RETURN: Add to ToLocation
-      PICK: Subtract from FromLocation
-      TRANSFER: Subtract from FromLocation, Add to ToLocation
-      ADJUST: (Handled via Adjustments usually, but if used here, implies manual +/- ?)
-              Let's assume ADJUST here is just logging or behaves like Transfer if both locs exist? 
-              For safety, we will restrict ADJUST to use createAdjustment API. 
-              But if user uses this UI, we support:
-              - If only ToLocation -> Add
-              - If only FromLocation -> Subtract
-    */
-
-    // Helper to Add Stock
     const addStock = async (locId, q, batchNum) => {
       if (!locId) throw new Error('Destination location required');
       const loc = await (require('../models').Location).findByPk(locId);
@@ -1060,21 +1144,11 @@ async function createMovement(data, reqUser) {
       await warehouseService.validateCapacity(loc.warehouseId, q, { transaction });
 
       const where = {
-        productId: data.productId,
-        warehouseId: loc.warehouseId, // Use resolved warehouseId
+        productId,
+        warehouseId: loc.warehouseId,
         locationId: locId,
         batchNumber: batchNum || null
       };
-
-      // We need to resolve warehouseId efficiently. 
-      // Assuming Location belongs to a Warehouse.
-      // Optimisation: movement creates usually pass warehouse context? No, just loc IDs.
-      // Let's look up location.
-
-      // Check if stock exists
-      // Note: ProductStock unique key is usually product+warehouse+location+batch
-      // We need to be careful with "null" batchNumber in where clause if DB treats it uniquely.
-      // Sequelize "where: { batchNumber: null }" works for finding NULLs.
 
       let stock = await ProductStock.findOne({ where, transaction });
       if (stock) {
@@ -1088,15 +1162,13 @@ async function createMovement(data, reqUser) {
       }
     };
 
-    // Helper to Remove Stock
     const removeStock = async (locId, q, batchNum) => {
       if (!locId) throw new Error('Source location required');
-      // Resolve warehouse from location
       const loc = await (require('../models').Location).findByPk(locId);
       if (!loc) throw new Error(`Location ${locId} not found`);
 
       const where = {
-        productId: data.productId,
+        productId,
         warehouseId: loc.warehouseId,
         locationId: locId,
         batchNumber: batchNum || null
@@ -1167,8 +1239,44 @@ async function removeMovement(id, reqUser) {
   const movement = await Movement.findByPk(id);
   if (!movement) throw new Error('Movement not found');
   if (reqUser.role !== 'super_admin' && movement.companyId !== reqUser.companyId) throw new Error('Movement not found');
-  await movement.destroy();
-  return { message: 'Movement deleted' };
+
+  const transaction = await sequelize.transaction();
+  try {
+    const { ProductStock } = require('../models');
+
+    // Revert logic based on type
+    const revertAdd = async (locId, q, batchNo) => {
+      const stock = await ProductStock.findOne({
+        where: { productId: movement.productId, locationId: locId, batchNumber: batchNo || null },
+        transaction
+      });
+      if (stock) await stock.decrement('quantity', { by: q, transaction });
+    };
+
+    const revertRemove = async (locId, q, batchNo) => {
+      const stock = await ProductStock.findOne({
+        where: { productId: movement.productId, locationId: locId, batchNumber: batchNo || null },
+        transaction
+      });
+      if (stock) await stock.increment('quantity', { by: q, transaction });
+    };
+
+    if (movement.type === 'RECEIVE' || movement.type === 'RETURN') {
+      await revertAdd(movement.toLocationId, movement.quantity, movement.batchNumber);
+    } else if (movement.type === 'PICK') {
+      await revertRemove(movement.fromLocationId, movement.quantity, movement.batchNumber);
+    } else if (movement.type === 'TRANSFER') {
+      await revertRemove(movement.fromLocationId, movement.quantity, movement.batchNumber);
+      await revertAdd(movement.toLocationId, movement.quantity, movement.batchNumber);
+    }
+
+    await movement.destroy({ transaction });
+    await transaction.commit();
+    return { message: 'Movement deleted and stock reverted' };
+  } catch (err) {
+    await transaction.rollback();
+    throw err;
+  }
 }
 
 module.exports = {
@@ -1191,6 +1299,7 @@ module.exports = {
   listStockByLocation,
   listAdjustments,
   createAdjustment,
+  removeAdjustment,
   listCycleCounts,
   createCycleCount,
   completeCycleCount,
