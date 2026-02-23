@@ -2,20 +2,42 @@ require('dotenv').config();
 const path = require('path');
 const { Sequelize } = require('sequelize');
 
-// Database name: warehouse_wms (MySQL ya SQLite file)
-const DB_NAME = process.env.DB_NAME || 'warehouse_wms';
 const dialect = process.env.DB_DIALECT || 'sqlite';
 let sequelize;
 
 if (dialect === 'mysql') {
-  sequelize = new Sequelize(DB_NAME, process.env.DB_USER || 'root', process.env.DB_PASSWORD || '', {
-    host: process.env.DB_HOST || 'localhost',
+
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is not defined in environment variables");
+  }
+
+  sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: 'mysql',
     logging: process.env.NODE_ENV === 'development' ? console.log : false,
+
+    dialectOptions: {
+      ssl: {
+        require: true,
+        rejectUnauthorized: false
+      },
+      connectTimeout: 60000
+    },
+
+    pool: {
+      max: 10,
+      min: 0,
+      acquire: 60000,
+      idle: 10000
+    }
   });
+
 } else {
-  // SQLite (default) - file: wmsbackend/warehouse_wms.sqlite
-  const sqlitePath = process.env.DB_STORAGE || path.join(__dirname, '..', 'warehouse_wms.sqlite');
+
+  // SQLite fallback
+  const sqlitePath =
+    process.env.DB_STORAGE ||
+    path.join(__dirname, '..', 'warehouse_wms.sqlite');
+
   sequelize = new Sequelize({
     dialect: 'sqlite',
     storage: sqlitePath,
