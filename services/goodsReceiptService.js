@@ -1,5 +1,5 @@
 const { Op } = require('sequelize');
-const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse } = require('../models');
+const { GoodsReceipt, GoodsReceiptItem, PurchaseOrder, PurchaseOrderItem, Supplier, Product, ProductStock, Warehouse, Movement } = require('../models');
 
 async function list(reqUser, query = {}) {
   const where = {};
@@ -157,14 +157,14 @@ async function updateReceived(id, body, reqUser) {
       }
 
       try {
-        // Pehle is product ka koi existing stock record dhoondo (company ke kisi bhi warehouse me) — naya record mat banao jab tak existing na mile
+        // Pehle is product ka koi existing stock record dhoondo (company ke kisi bhi warehouse me)
         let stock = await ProductStock.findOne({
           where: { productId: pid, warehouseId: { [Op.in]: warehouseIds } },
         });
         if (stock) {
           await stock.update({ quantity: (Number(stock.quantity) || 0) + qtyToAdd });
         } else {
-          await ProductStock.create({
+          stock = await ProductStock.create({
             productId: pid,
             warehouseId: defaultWarehouseId,
             quantity: qtyToAdd,
@@ -172,6 +172,19 @@ async function updateReceived(id, body, reqUser) {
             status: 'ACTIVE',
           });
         }
+
+        // [NEW] Log as Movement for Live Stock feed
+        await Movement.create({
+          companyId: updated.companyId,
+          type: 'RECEIVE',
+          productId: pid,
+          warehouseId: stock ? stock.warehouseId : defaultWarehouseId,
+          toLocationId: stock ? stock.locationId : null,
+          quantity: qtyToAdd,
+          reason: `Goods Receipt`,
+          createdBy: reqUser.id,
+        });
+
         stockUpdated = true;
       } catch (err) {
         stockWarning = (stockWarning ? stockWarning + ' ' : '') + (err.message || 'Stock update failed.');

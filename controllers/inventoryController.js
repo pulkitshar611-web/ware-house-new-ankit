@@ -1,4 +1,143 @@
 const inventoryService = require('../services/inventoryService');
+const { InventoryAdjustment, Movement, Product, Warehouse, User } = require('../models');
+const { Op } = require('sequelize');
+
+// [NEW] Unified live feed: merges inventory_adjustments + movements for Live Stock page
+async function liveFeed(req, res, next) {
+  try {
+    const companyId = req.user?.companyId;
+    const where = {};
+    if (req.user?.role !== 'super_admin') where.companyId = companyId;
+    const limit = parseInt(req.query.limit, 10) || 100;
+
+    // Fetch adjustments (all required associations)
+    const adjustments = await InventoryAdjustment.findAll({
+      where,
+      order: [['createdAt', 'DESC']],
+      limit,
+      include: [
+        { model: Product, attributes: ['id', 'name', 'sku'], required: false },
+        { model: Warehouse, attributes: ['id', 'name'], required: false },
+        { model: User, as: 'createdByUser', attributes: ['id', 'name'], required: false },
+      ],
+    });
+
+    // Fetch movements
+    const movements = await Movement.findAll({
+      where,
+      order: [['createdAt', 'DESC']],
+      limit,
+      include: [
+        { model: Product, attributes: ['id', 'name', 'sku'], required: false },
+        { model: Warehouse, attributes: ['id', 'name'], required: false },
+      ],
+    });
+
+    // Normalize adjustments
+    const adjNormalized = adjustments.map((a) => {
+      const j = a.toJSON();
+      return {
+        id: `adj-${j.id}`,
+        source: 'adjustment',
+        type: j.type,
+        productId: j.productId,
+        Product: j.Product,
+        Warehouse: j.Warehouse,
+        warehouseId: j.warehouseId,
+        quantity: j.quantity,
+        reason: j.reason,
+        notes: j.notes,
+        user: j.createdByUser || null,
+        createdAt: j.createdAt,
+      };
+    });
+
+    // Normalize movements
+    const movNormalized = movements.map((m) => {
+      const j = m.toJSON();
+      return {
+        id: `mov-${j.id}`,
+        source: 'movement',
+        type: j.type,
+        productId: j.productId,
+        Product: j.Product,
+        Warehouse: j.Warehouse,
+        warehouseId: j.warehouseId,
+        quantity: j.quantity,
+        reason: j.reason,
+        notes: j.notes,
+        user: null,
+        createdAt: j.createdAt,
+      };
+    });
+
+    // Deduplicate: skip adj if a movement covers same product+qty+minute (after our new logging)
+    const movKeys = new Set(movNormalized.map(m =>
+      `${m.productId}-${Math.abs(m.quantity)}-${new Date(m.createdAt).toISOString().substring(0, 16)}`
+    ));
+    const filteredAdj = adjNormalized.filter(a =>
+      !movKeys.has(`${a.productId}-${Math.abs(a.quantity)}-${new Date(a.createdAt).toISOString().substring(0, 16)}`)
+    );
+
+    // Aggregation for Today's Stats (using server/DB local day)
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const [todayInRes, todayOutRes] = await Promise.all([
+      Movement.sum('quantity', {
+        where: {
+          ...where,
+          createdAt: { [Op.gte]: todayStart },
+          type: { [Op.in]: ['INCREASE', 'INBOUND', 'RECEIVE', 'RETURN'] }
+        }
+      }),
+      Movement.sum('quantity', {
+        where: {
+          ...where,
+          createdAt: { [Op.gte]: todayStart },
+          type: { [Op.in]: ['DECREASE', 'OUTBOUND', 'SHIPMENT', 'PICK'] }
+        }
+      })
+    ]);
+
+    // Also include old adjustments in counts for today
+    const [adjInRes, adjOutRes] = await Promise.all([
+      InventoryAdjustment.sum('quantity', {
+        where: {
+          ...where,
+          createdAt: { [Op.gte]: todayStart },
+          type: 'INCREASE'
+        }
+      }),
+      InventoryAdjustment.sum('quantity', {
+        where: {
+          ...where,
+          createdAt: { [Op.gte]: todayStart },
+          type: 'DECREASE'
+        }
+      })
+    ]);
+
+    const totalIn = (Number(todayInRes) || 0) + (Number(adjInRes) || 0);
+    const totalOut = (Number(todayOutRes) || 0) + (Number(adjOutRes) || 0);
+
+    const feed = [...movNormalized, ...filteredAdj]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, limit);
+
+    res.json({
+      success: true,
+      data: feed,
+      stats: {
+        totalIn,
+        totalOut
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 
 async function listProducts(req, res, next) {
   try {
@@ -361,4 +500,5 @@ module.exports = {
   createMovement,
   updateMovement,
   removeMovement,
+  liveFeed,
 };

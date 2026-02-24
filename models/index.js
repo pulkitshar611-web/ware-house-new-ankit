@@ -153,7 +153,7 @@ Batch.belongsTo(Location, { foreignKey: 'locationId' });
 Supplier.hasMany(Batch, { foreignKey: 'supplierId' });
 Batch.belongsTo(Supplier, { foreignKey: 'supplierId' });
 
-// Movement (fromLocation, toLocation, createdByUser)
+// Movement (fromLocation, toLocation, createdByUser, warehouse)
 Product.hasMany(Movement, { foreignKey: 'productId' });
 Movement.belongsTo(Product, { foreignKey: 'productId' });
 Batch.hasMany(Movement, { foreignKey: 'batchId' });
@@ -164,6 +164,8 @@ Location.hasMany(Movement, { foreignKey: 'toLocationId', as: 'movementsTo' });
 Movement.belongsTo(Location, { foreignKey: 'toLocationId', as: 'toLocation' });
 User.hasMany(Movement, { foreignKey: 'createdBy', as: 'movementsCreated' });
 Movement.belongsTo(User, { foreignKey: 'createdBy', as: 'createdByUser' });
+Warehouse.hasMany(Movement, { foreignKey: 'warehouseId' });
+Movement.belongsTo(Warehouse, { foreignKey: 'warehouseId' });
 
 // ReplenishmentTask (fromLocation, toLocation)
 Product.hasMany(ReplenishmentTask, { foreignKey: 'productId' });

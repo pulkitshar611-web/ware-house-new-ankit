@@ -143,6 +143,18 @@ async function complete(orderId, user) {
             } else {
                 throw new Error(`Stock record not found for product ID ${productId}`);
             }
+            // 3. Create Movement Record for Live Stock feed
+            const { Movement } = require('../models');
+            await Movement.create({
+                companyId: user.companyId,
+                type: isIncrease ? 'INCREASE' : 'DECREASE',
+                productId,
+                warehouseId,
+                toLocationId: stock ? stock.locationId : null,
+                quantity: absQty,
+                reason,
+                createdBy: user.id
+            }, { transaction: t });
         };
 
         // 1. Decrease stock for ingredients

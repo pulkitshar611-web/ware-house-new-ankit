@@ -650,6 +650,19 @@ async function createAdjustment(data, reqUser) {
     }
   }
   await adjustment.update({ status: 'COMPLETED' });
+
+  // [NEW] Log as Movement for Live Stock feed
+  await Movement.create({
+    companyId: effectiveCompanyId,
+    type: type, // INCREASE or DECREASE
+    productId: productId,
+    warehouseId: warehouseId || (stock && stock.warehouseId) || null,
+    toLocationId: stock ? stock.locationId : null,
+    quantity: qty,
+    reason: data.reason || 'Manual Adjustment',
+    notes: data.notes || `Reference: ${referenceNumber}`,
+    createdBy: reqUser.id,
+  });
   return InventoryAdjustment.findByPk(adjustment.id, {
     include: [
       { association: 'Product', attributes: ['id', 'name', 'sku'] },
@@ -1027,6 +1040,7 @@ async function listMovements(reqUser, query = {}) {
       { association: 'fromLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'toLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
+      { association: 'Warehouse', required: false, attributes: ['id', 'name', 'code'] },
     ],
   });
   return list.map((m) => {

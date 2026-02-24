@@ -90,6 +90,8 @@ app.delete('/api/inventory/products/:id', authenticate, requireRole(...invProduc
 const scanRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
 app.delete('/api/inventory/adjustments/:id', authenticate, requireRole(...scanRoles), inventoryController.removeAdjustment);
 app.delete('/api/inventory/movements/:id', authenticate, requireRole(...scanRoles), inventoryController.removeMovement);
+// Live-feed: unified adjustments + movements for Real-time Stock Monitor
+app.get('/api/inventory/live-feed', authenticate, requireRole(...scanRoles, 'viewer'), inventoryController.liveFeed);
 app.delete('/api/shipments/:id', authenticate, requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.remove);
 
 // POST /api/products/:id/alternative-skus (same handler as inventory, so client can call either path)
@@ -152,6 +154,23 @@ async function start() {
     }
     // MySQL: skip alter to avoid "Too many keys" on tables that already have many indexes (e.g. users)
     await sequelize.sync({ alter: dialect === 'sqlite' });
+
+    // Safe migration: ensure warehouse_id column exists in movements (for MySQL which skips alter)
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('movements');
+      if (!tableDescription.warehouse_id) {
+        await queryInterface.addColumn('movements', 'warehouse_id', {
+          type: require('sequelize').DataTypes.INTEGER,
+          allowNull: true,
+          defaultValue: null,
+        });
+        console.log('[Migration] Added warehouse_id column to movements table.');
+      }
+    } catch (migrationErr) {
+      console.warn('[Migration Warning] Could not add warehouse_id to movements:', migrationErr.message);
+    }
+
     if (dialect === 'sqlite') {
       await sequelize.query('PRAGMA foreign_keys = ON');
     }

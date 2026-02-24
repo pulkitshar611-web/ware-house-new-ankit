@@ -52,4 +52,7 @@ router.post('/movements', requireRole('super_admin', 'company_admin', 'warehouse
 router.put('/movements/:id', requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'), inventoryController.updateMovement);
 router.delete('/movements/:id', requireRole(...scanRoles), inventoryController.removeMovement);
 
+// Live Stock Monitor - unified feed (adjustments + movements merged)
+router.get('/live-feed', requireRole(...readRoles), inventoryController.liveFeed);
+
 module.exports = router;
