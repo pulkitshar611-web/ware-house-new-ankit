@@ -51,6 +51,15 @@ DB_USER=root
 DB_PASSWORD=your_password
 ```
 
+> **Tip:** if you are running on Railway/Heroku or another host that
+offers a `DATABASE_URL` you can omit the individual vars and just set the
+URL:
+>
+> ```env
+> DATABASE_URL=mysql://user:pass@host:port/warehouse_wms
+> ```
+>
+> The app will automatically use it when present.
 ### 3. Tables banao
 - Ya to **warehouse_wms.sql** run karo MySQL me (warehouse_wms select karke)
 - Ya sirf `npm start` chalao – Sequelize tables khud bana dega
