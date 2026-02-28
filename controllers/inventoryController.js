@@ -208,6 +208,12 @@ async function removeProduct(req, res, next) {
     res.json({ success: true, message: 'Product deleted' });
   } catch (err) {
     if (err.message === 'Product not found') return res.status(404).json({ success: false, message: err.message });
+    if (err.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(400).json({
+        success: false,
+        message: 'This product cannot be deleted because it is currently linked to movements, stock, or active orders. Please remove secondary records first.'
+      });
+    }
     next(err);
   }
 }
@@ -247,6 +253,12 @@ async function removeCategory(req, res, next) {
     res.json({ success: true, message: 'Category deleted' });
   } catch (err) {
     if (err.message === 'Category not found') return res.status(404).json({ success: false, message: err.message });
+    if (err.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(400).json({
+        success: false,
+        message: 'This category cannot be deleted because it is still assigned to some products. Please reassign the products first.'
+      });
+    }
     next(err);
   }
 }
@@ -286,6 +298,12 @@ async function removeStock(req, res, next) {
     res.json({ success: true, message: 'Stock record deleted' });
   } catch (err) {
     if (err.message === 'Stock not found') return res.status(404).json({ success: false, message: err.message });
+    if (err.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(400).json({
+        success: false,
+        message: 'This stock record cannot be deleted because it is associated with active orders or movements. Please clear related logs first.'
+      });
+    }
     next(err);
   }
 }

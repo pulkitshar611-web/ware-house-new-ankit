@@ -140,6 +140,41 @@ async function createProduct(data, reqUser) {
   };
   console.log('[DEBUG_SERVICE] Creating Product Payload:', JSON.stringify(payload, null, 2));
   const created = await Product.create(payload);
+
+  // [NEW] Handle Initial Stock creation if openingStock is provided
+  const openingStock = Number(data.openingStock) || 0;
+  const { initialWarehouseId, initialLocationId } = data;
+  if (openingStock > 0 && initialWarehouseId) {
+    await ProductStock.create({
+      productId: created.id,
+      warehouseId: initialWarehouseId,
+      locationId: initialLocationId || null,
+      quantity: openingStock,
+      status: 'ACTIVE',
+    });
+
+    // Log movement for Live Stock feed
+    await Movement.create({
+      companyId: payload.companyId,
+      productId: created.id,
+      warehouseId: initialWarehouseId,
+      toLocationId: initialLocationId || null,
+      type: 'INCREASE',
+      quantity: openingStock,
+      reason: 'Opening Stock',
+      createdBy: reqUser.id,
+    });
+  } else if (initialWarehouseId) {
+    // Even if 0 stock, create the stock record so it appears in Live Stock if needed
+    await ProductStock.create({
+      productId: created.id,
+      warehouseId: initialWarehouseId,
+      locationId: initialLocationId || null,
+      quantity: 0,
+      status: 'ACTIVE',
+    });
+  }
+
   return normalizeProductJson(created);
 }
 

@@ -3,12 +3,18 @@ const { Op } = require('sequelize');
 
 async function list(reqUser, query = {}) {
   const where = {};
-  if (query.warehouseId) where.warehouseId = query.warehouseId;
   if (reqUser.role === 'company_admin' && reqUser.companyId) {
     const whIds = await Warehouse.findAll({ where: { companyId: reqUser.companyId }, attributes: ['id'] });
-    where.warehouseId = { [Op.in]: whIds.map(w => w.id) };
+    const whIdList = whIds.map(w => w.id);
+    if (query.warehouseId) {
+      where.warehouseId = whIdList.includes(Number(query.warehouseId)) ? query.warehouseId : { [Op.in]: [] };
+    } else {
+      where.warehouseId = { [Op.in]: whIdList };
+    }
   } else if (reqUser.role !== 'super_admin' && reqUser.warehouseId) {
     where.warehouseId = reqUser.warehouseId;
+  } else if (query.warehouseId) {
+    where.warehouseId = query.warehouseId;
   }
   const zones = await Zone.findAll({
     where,

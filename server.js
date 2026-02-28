@@ -171,6 +171,25 @@ async function start() {
       console.warn('[Migration Warning] Could not add warehouse_id to movements:', migrationErr.message);
     }
 
+    // Safe migration: ensure is_production column exists in warehouses
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('warehouses');
+      if (!tableDescription.is_production && !tableDescription.isProduction) {
+        console.log('[Migration] Column is_production not found, attempting to add...');
+        await queryInterface.addColumn('warehouses', 'is_production', {
+          type: require('sequelize').DataTypes.BOOLEAN,
+          allowNull: false,
+          defaultValue: false,
+        });
+        console.log('[Migration] Added is_production column to warehouses table.');
+      } else {
+        console.log('[Migration] is_production column already exists.');
+      }
+    } catch (migrationErr) {
+      console.error('[Migration Error] Critical failure adding is_production to warehouses:', migrationErr);
+    }
+
     if (dialect === 'sqlite') {
       await sequelize.query('PRAGMA foreign_keys = ON');
     }

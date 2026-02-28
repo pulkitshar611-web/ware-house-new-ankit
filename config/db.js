@@ -7,20 +7,15 @@ const DB_NAME = process.env.DB_NAME || 'warehouse_wms';
 const dialect = process.env.DB_DIALECT || 'sqlite';
 let sequelize;
 
-// `DATABASE_URL` is provided by Railway and other cloud providers; Sequelize can
-// accept a connection string directly.  If it's defined we prefer it over the
-// individual components so the project can be deployed without duplicating
-// credentials in several environment variables.
-
 if (dialect === 'mysql') {
-  if (process.env.DATABASE_URL) {
-    // allow full URL such as `mysql://user:pass@host:port/dbname`
-    sequelize = new Sequelize(process.env.DATABASE_URL, {
+  const mysqlUrl = process.env.MYSQL_URL || process.env.DATABASE_URL;
+  if (mysqlUrl) {
+    // Railway MySQL service provide MYSQL_URL or DATABASE_URL
+    sequelize = new Sequelize(mysqlUrl, {
       dialect: 'mysql',
       logging: process.env.NODE_ENV === 'development' ? console.log : false,
     });
   } else {
-    // fall back to the legacy style variables
     sequelize = new Sequelize(DB_NAME, process.env.DB_USER || 'root', process.env.DB_PASSWORD || '', {
       host: process.env.DB_HOST || 'localhost',
       dialect: 'mysql',
