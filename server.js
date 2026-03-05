@@ -14,6 +14,8 @@ const dashboardController = require('./controllers/dashboardController');
 const reportController = require('./controllers/reportController');
 const analyticsController = require('./controllers/analyticsController');
 const shipmentController = require('./controllers/shipmentController');
+const notificationController = require('./controllers/notificationController');
+const notificationService = require('./services/notificationService');
 const cronService = require('./services/cronService');
 
 const app = express();
@@ -171,6 +173,153 @@ async function start() {
       console.warn('[Migration Warning] Could not add warehouse_id to movements:', migrationErr.message);
     }
 
+    // Safe migration: ensure is_production column exists in warehouses
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('warehouses');
+      if (!tableDescription.is_production && !tableDescription.isProduction) {
+        console.log('[Migration] Column is_production not found, attempting to add...');
+        await queryInterface.addColumn('warehouses', 'is_production', {
+          type: require('sequelize').DataTypes.BOOLEAN,
+          allowNull: false,
+          defaultValue: false,
+        });
+        console.log('[Migration] Added is_production column to warehouses table.');
+      } else {
+        console.log('[Migration] is_production column already exists.');
+      }
+    } catch (migrationErr) {
+      console.error('[Migration Error] Critical failure adding is_production to warehouses:', migrationErr);
+    }
+
+    // Safe migration: ensure currency column exists in products
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('products');
+      if (!tableDescription.currency) {
+        console.log('[Migration] Column currency not found in products, attempting to add...');
+        await queryInterface.addColumn('products', 'currency', {
+          type: require('sequelize').DataTypes.STRING,
+          allowNull: true,
+          defaultValue: 'EUR',
+        });
+        console.log('[Migration] Added currency column to products table.');
+      } else {
+        console.log('[Migration] currency column already exists in products.');
+      }
+    } catch (migrationErr) {
+      console.error('[Migration Error] Failure adding currency to products:', migrationErr.message);
+    }
+
+    // Safe migration: ensure new columns exist in production_orders
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('production_orders');
+      const newCols = [
+        { name: 'product_id', type: require('sequelize').DataTypes.INTEGER },
+        { name: 'formula_id', type: require('sequelize').DataTypes.INTEGER },
+        { name: 'production_area_id', type: require('sequelize').DataTypes.INTEGER },
+        { name: 'target_warehouse_id', type: require('sequelize').DataTypes.INTEGER },
+        { name: 'quantity_goal', type: require('sequelize').DataTypes.DECIMAL(12, 2), defaultValue: 0 },
+        { name: 'quantity_produced', type: require('sequelize').DataTypes.DECIMAL(12, 2), defaultValue: 0 },
+        { name: 'start_date', type: require('sequelize').DataTypes.DATE },
+        { name: 'completion_date', type: require('sequelize').DataTypes.DATE },
+        { name: 'status', type: require('sequelize').DataTypes.STRING, defaultValue: 'DRAFT' }
+      ];
+
+      for (const col of newCols) {
+        if (!tableDescription[col.name]) {
+          console.log(`[Migration] Adding ${col.name} to production_orders...`);
+          await queryInterface.addColumn('production_orders', col.name, {
+            type: col.type,
+            allowNull: true,
+            defaultValue: col.defaultValue || null
+          });
+        }
+      }
+    } catch (migrationErr) {
+      console.warn('[Migration Warning] Could not update production_orders (it might not exist yet):', migrationErr.message);
+    }
+
+    // Safe migration: ensure no order has NULL status and status is STRING
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('production_orders');
+
+      // If it's an enum or doesn't match STRING, we modify it
+      if (tableDescription.status && tableDescription.status.type.includes('ENUM')) {
+        console.log('[Migration] production_orders.status is ENUM, converting to VARCHAR(255)...');
+        await sequelize.query("ALTER TABLE production_orders MODIFY COLUMN status VARCHAR(255) DEFAULT 'DRAFT'");
+      }
+
+      await sequelize.query("UPDATE production_orders SET status = 'DRAFT' WHERE status IS NULL OR status = ''").catch(() => { });
+    } catch (err) {
+      console.warn('[Migration Warning] Could not safely modify production_orders.status:', err.message);
+    }
+
+    // Safe migration: ensure wastage_percentage in production_formula_items
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('production_formula_items');
+      if (!tableDescription.wastage_percentage) {
+        await queryInterface.addColumn('production_formula_items', 'wastage_percentage', {
+          type: require('sequelize').DataTypes.DECIMAL(5, 2),
+          allowNull: true,
+          defaultValue: 0
+        });
+        console.log('[Migration] Added wastage_percentage to production_formula_items.');
+      }
+    } catch (err) {
+      // ignore
+    }
+
+    // Safe migration: ensure warehouse_id and unit exist in production_order_items
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('production_order_items');
+      if (!tableDescription.warehouse_id) {
+        await queryInterface.addColumn('production_order_items', 'warehouse_id', {
+          type: require('sequelize').DataTypes.INTEGER,
+          allowNull: true
+        });
+      }
+      if (!tableDescription.unit) {
+        await queryInterface.addColumn('production_order_items', 'unit', {
+          type: require('sequelize').DataTypes.STRING,
+          allowNull: true
+        });
+      }
+      // Also ensure quantities are DECIMAL (might need fresh install or manual change for existings, but adding columns helps)
+    } catch (err) {
+      console.warn('[Migration Warning] Could not update production_order_items:', err.message);
+    }
+
+    // Safe migration: notifications table (if not handled by alter)
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableExists = await queryInterface.showAllTables();
+      if (!tableExists.includes('notifications')) {
+        console.log('[Migration] Creating notifications table...');
+        await sequelize.query(`
+          CREATE TABLE IF NOT EXISTS notifications (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            company_id INT NOT NULL,
+            user_id INT NULL,
+            title VARCHAR(255) NOT NULL,
+            message TEXT NOT NULL,
+            type ENUM('info', 'warning', 'success', 'error') DEFAULT 'info',
+            priority ENUM('low', 'medium', 'high') DEFAULT 'medium',
+            is_read BOOLEAN DEFAULT FALSE,
+            link VARCHAR(255) NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+      }
+    } catch (err) {
+      console.warn('[Migration Warning] Could not create notifications table:', err.message);
+    }
+
     if (dialect === 'sqlite') {
       await sequelize.query('PRAGMA foreign_keys = ON');
     }
@@ -179,8 +328,17 @@ async function start() {
     // Initialize Cron AFTER database sync is complete
     cronService.init();
 
-    app.listen(PORT, () => {
-      console.log(`WMS Backend running at http://localhost:${PORT}`);
+    app.listen(PORT, async () => {
+      console.log(`Server is running on port ${PORT}`);
+
+      // Trigger initial low stock check for all active companies
+      const { Company } = require('./models');
+      const companies = await Company.findAll({ where: { status: 'ACTIVE' }, attributes: ['id'] });
+      for (const company of companies) {
+        notificationService.checkLowStockAndNotify(company.id).catch(err => {
+          console.error(`[Startup] Failed to check low stock for company ${company.id}:`, err.message);
+        });
+      }
       console.log('Auth: POST /auth/login | GET /auth/me (Bearer token)');
       console.log('Super Admin: /api/superadmin/companies');
       console.log('Company: /api/company/profile');

@@ -45,6 +45,7 @@ async function create(data, reqUser) {
     address: data.address || null,
     phone: data.phone || null,
     capacity: data.capacity != null ? Number(data.capacity) : null,
+    isProduction: !!data.isProduction,
     status: data.status || 'ACTIVE',
   });
 }
@@ -60,6 +61,7 @@ async function update(id, data, reqUser) {
     address: data.address !== undefined ? data.address : wh.address,
     phone: data.phone !== undefined ? data.phone : wh.phone,
     capacity: data.capacity !== undefined ? (data.capacity != null ? Number(data.capacity) : null) : wh.capacity,
+    isProduction: data.isProduction !== undefined ? !!data.isProduction : wh.isProduction,
     status: data.status ?? wh.status,
   });
   return wh;

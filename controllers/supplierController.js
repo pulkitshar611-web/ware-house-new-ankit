@@ -44,6 +44,15 @@ async function remove(req, res, next) {
     res.json({ success: true, message: 'Supplier deleted' });
   } catch (err) {
     if (err.message === 'Supplier not found') return res.status(404).json({ success: false, message: err.message });
+
+    // Catch database constraint errors
+    if (err.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(400).json({
+        success: false,
+        message: 'This supplier cannot be deleted because it is being used in other records (like products or purchase orders).'
+      });
+    }
+
     next(err);
   }
 }

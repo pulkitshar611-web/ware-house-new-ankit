@@ -1,15 +1,27 @@
-const { ProductionOrder, ProductionOrderItem, Product, ProductStock, Bundle, BundleItem, InventoryAdjustment, sequelize } = require('../models');
+const {
+    ProductionOrder,
+    ProductionOrderItem,
+    Product,
+    ProductStock,
+    ProductionFormula,
+    ProductionFormulaItem,
+    InventoryAdjustment,
+    Movement,
+    sequelize
+} = require('../models');
 const { Op } = require('sequelize');
 
 async function list(user, query = {}) {
-    const { status } = query;
+    const { status, productionAreaId } = query;
     const where = { companyId: user.companyId };
     if (status) where.status = status;
+    if (productionAreaId) where.productionAreaId = productionAreaId;
 
     return await ProductionOrder.findAll({
         where,
         include: [
             { model: Product },
+            { model: ProductionFormula },
             {
                 model: ProductionOrderItem,
                 include: [{ model: Product }]
@@ -19,78 +31,239 @@ async function list(user, query = {}) {
     });
 }
 
+/**
+ * 4️⃣ Automatic Raw Material Calculation Engine
+ * Create Order: Links formula and calculates required materials
+ */
 async function create(data, user) {
-    const { productId, warehouseId, quantityGoal, notes } = data;
+    const { productId, warehouseId, formulaId, quantityGoal, productionAreaId, notes } = data;
 
     return await sequelize.transaction(async (t) => {
         const product = await Product.findByPk(productId);
         if (!product) throw new Error('Product not found');
 
+        // Find Formula (Default if not specified)
+        let formula;
+        if (formulaId) {
+            formula = await ProductionFormula.findByPk(formulaId, {
+                include: [{ model: ProductionFormulaItem }]
+            });
+        } else {
+            // 1st: exact match — default formula for this company
+            formula = await ProductionFormula.findOne({
+                where: { productId, companyId: user.companyId, isDefault: true },
+                include: [{ model: ProductionFormulaItem }]
+            });
+            // 2nd: any formula for this company
+            if (!formula) {
+                formula = await ProductionFormula.findOne({
+                    where: { productId, companyId: user.companyId },
+                    include: [{ model: ProductionFormulaItem }]
+                });
+            }
+            // 3rd (last resort): any formula for this product regardless of company
+            if (!formula) {
+                formula = await ProductionFormula.findOne({
+                    where: { productId },
+                    include: [{ model: ProductionFormulaItem }]
+                });
+            }
+        }
+
+        if (!formula) throw new Error(
+            `No formula found for product #${productId}. ` +
+            `Please go to Manufacturing → Formulas and create a formula for this product first.`
+        );
+
         const order = await ProductionOrder.create({
             companyId: user.companyId,
             productId,
-            warehouseId,
+            formulaId: formula.id,
+            warehouseId, // Target Warehouse for finished goods
+            targetWarehouseId: warehouseId,
             quantityGoal,
+            productionAreaId,
             notes,
-            status: 'PENDING'
+            status: 'DRAFT'
         }, { transaction: t });
 
-        // Try to find if this product has a BOM (Bundle)
-        // Match by SKU or Name
-        const bundle = await Bundle.findOne({
-            where: {
-                companyId: user.companyId,
-                [Op.or]: [
-                    { sku: product.sku },
-                    { name: product.name }
-                ]
-            },
-            include: [{ model: BundleItem }]
-        });
+        // Calculate and create required items
+        const items = formula.ProductionFormulaItems.map(fItem => ({
+            productionOrderId: order.id,
+            productId: fItem.productId,
+            // Required Qty = qty_per_unit * production_quantity
+            quantityRequired: parseFloat(fItem.quantityPerUnit) * parseFloat(quantityGoal),
+            quantityPicked: 0,
+            unit: fItem.unit,
+            warehouseId: fItem.warehouseId || warehouseId // Fallback to order warehouse
+        }));
 
-        if (bundle && bundle.BundleItems) {
-            const items = bundle.BundleItems.map(item => ({
-                productionOrderId: order.id,
-                productId: item.productId,
-                quantityRequired: item.quantity * quantityGoal,
-                quantityPicked: 0
-            }));
-            await ProductionOrderItem.bulkCreate(items, { transaction: t });
-        }
+        await ProductionOrderItem.bulkCreate(items, { transaction: t });
 
         return order;
     });
 }
 
-async function pickIngredient(orderId, ingredientId, quantity, user) {
-    try {
-        const q = parseInt(quantity, 10) || 0;
-        const oId = parseInt(orderId, 10);
-        const pId = parseInt(ingredientId, 10);
+/**
+ * 5️⃣ Stock Validation Before Production
+ */
+async function validateStock(orderId, user, transaction = null) {
+    const order = await ProductionOrder.findByPk(orderId, {
+        include: [{ model: ProductionOrderItem }],
+        transaction
+    });
 
-        if (!oId || !pId) throw new Error('Invalid Order ID or Product ID');
+    if (!order) {
+        console.error(`[validateStock] Order ${orderId} NOT FOUND`);
+        throw new Error('Production Order not found');
+    }
 
-        let item = await ProductionOrderItem.findOne({
-            where: { productionOrderId: oId, productId: pId }
+    console.log(`[validateStock] Checking Order #${orderId} (Current Status: ${order.status})`);
+
+    const stockChecks = [];
+    for (const item of order.ProductionOrderItems) {
+        const stock = await ProductStock.sum('quantity', {
+            where: {
+                productId: item.productId,
+                warehouseId: item.warehouseId || order.warehouseId
+            },
+            transaction
+        }) || 0;
+
+        stockChecks.push({
+            productId: item.productId,
+            required: parseFloat(item.quantityRequired),
+            available: parseFloat(stock),
+            isAvailable: parseFloat(stock) >= parseFloat(item.quantityRequired)
+        });
+    }
+
+    const allAvailable = stockChecks.every(c => c.isAvailable);
+
+    const currentStatus = (order.status || 'DRAFT').toUpperCase();
+    console.log(`[validateStock] allAvailable: ${allAvailable}, currentStatus: ${currentStatus}`);
+
+    if (allAvailable && currentStatus === 'DRAFT') {
+        console.log(`[validateStock] Updating status of #${orderId} to VALIDATED`);
+        order.status = 'VALIDATED';
+        await order.save({ transaction });
+        // Force refresh if no transaction (to be safe for immediate fetch)
+        if (!transaction) await order.reload();
+    }
+
+    return { allAvailable, stockChecks };
+}
+
+/**
+ * Helper to adjust stock for production movements
+ */
+async function adjustStock(companyId, userId, productId, warehouseId, qty, reason, orderId, transaction) {
+    const isIncrease = qty > 0;
+    const absQty = Math.abs(qty);
+
+    // 1. Create Adjustment Record
+    await InventoryAdjustment.create({
+        referenceNumber: `PROD-${orderId}`,
+        companyId,
+        productId,
+        warehouseId,
+        type: isIncrease ? 'INCREASE' : 'DECREASE',
+        quantity: absQty,
+        reason,
+        status: 'COMPLETED',
+        createdBy: userId
+    }, { transaction });
+
+    // 2. Update ProductStock
+    let stock = await ProductStock.findOne({
+        where: { productId, warehouseId },
+        transaction
+    });
+
+    if (stock) {
+        if (isIncrease) {
+            await stock.increment('quantity', { by: absQty, transaction });
+        } else {
+            if (parseFloat(stock.quantity) < absQty) {
+                const p = await Product.findByPk(productId);
+                throw new Error(`Insufficient stock for ${p?.name || productId} in warehouse ${warehouseId}`);
+            }
+            await stock.decrement('quantity', { by: absQty, transaction });
+        }
+    } else if (isIncrease) {
+        await ProductStock.create({
+            productId,
+            warehouseId,
+            quantity: absQty,
+            status: 'ACTIVE'
+        }, { transaction });
+    } else {
+        throw new Error(`No stock record found for product ID ${productId}`);
+    }
+
+    // 3. Movement Record
+    await Movement.create({
+        companyId,
+        type: isIncrease ? 'INCREASE' : 'DECREASE',
+        productId,
+        warehouseId,
+        quantity: absQty,
+        reason,
+        createdBy: userId
+    }, { transaction });
+}
+
+async function startProduction(orderId, user) {
+    return await sequelize.transaction(async (t) => {
+        const order = await ProductionOrder.findByPk(orderId, {
+            include: [{ model: ProductionOrderItem }],
+            transaction: t
         });
 
-        if (!item) {
-            item = await ProductionOrderItem.create({
-                productionOrderId: oId,
-                productId: pId,
-                quantityRequired: 0,
-                quantityPicked: q
-            });
-        } else {
-            item.quantityPicked = (parseInt(item.quantityPicked, 10) || 0) + q;
-            await item.save();
+        if (!order) throw new Error('Order not found');
+
+        let currentStatus = (order.status || 'DRAFT').toUpperCase();
+
+        // AUTO-VALIDATE: If still in DRAFT, try to validate now
+        if (currentStatus === 'DRAFT') {
+            const stockCheck = await validateStock(orderId, user, t);
+            if (stockCheck.allAvailable) {
+                order.status = 'VALIDATED';
+                await order.save({ transaction: t });
+                currentStatus = 'VALIDATED';
+            } else {
+                throw new Error('Cannot start production: Insufficient stock for one or more ingredients.');
+            }
         }
 
-        return item;
-    } catch (err) {
-        console.error('Error in pickIngredient:', err);
-        throw err;
-    }
+        if (currentStatus !== 'VALIDATED') {
+            console.error(`[startProduction] Invalid status for #${orderId}: ${currentStatus}`);
+            throw new Error(`Order must be in VALIDATED status to start production (Current: ${currentStatus}). Please click Validate Stock first.`);
+        }
+
+        console.log(`[startProduction] Proceeding with production for Order #${orderId}`);
+
+        // STEP: Deduct Raw Materials (STOCK OUT)
+        for (const item of order.ProductionOrderItems) {
+            await adjustStock(
+                user.companyId,
+                user.id,
+                item.productId,
+                item.warehouseId,
+                -parseFloat(item.quantityRequired),
+                `Consumed for Production Order #${order.id}`,
+                order.id,
+                t
+            );
+        }
+
+        console.log(`[startProduction] Setting status to IN_PRODUCTION for #${orderId}`);
+        order.status = 'IN_PRODUCTION';
+        order.startDate = new Date();
+        await order.save({ transaction: t });
+
+        return order;
+    });
 }
 
 async function complete(orderId, user) {
@@ -103,87 +276,21 @@ async function complete(orderId, user) {
         if (!order) throw new Error('Production order not found');
         if (order.status === 'COMPLETED') throw new Error('Order already completed');
 
-        const adjustStock = async (productId, warehouseId, qty, type, reason) => {
-            const absQty = Math.abs(qty);
-            const isIncrease = qty > 0;
-
-            // 1. Create Adjustment Record
-            await InventoryAdjustment.create({
-                referenceNumber: `PROD-${order.id}-${Date.now()}`,
-                companyId: user.companyId,
-                productId,
-                warehouseId,
-                type: isIncrease ? 'INCREASE' : 'DECREASE',
-                quantity: absQty,
-                reason,
-                status: 'COMPLETED',
-                createdBy: user.id
-            }, { transaction: t });
-
-            // 2. Update ProductStock
-            let stock = await ProductStock.findOne({
-                where: { productId, warehouseId },
-                transaction: t
-            });
-
-            if (stock) {
-                if (isIncrease) {
-                    await stock.increment('quantity', { by: absQty, transaction: t });
-                } else {
-                    if (stock.quantity < absQty) throw new Error(`Insufficient stock for product ID ${productId}`);
-                    await stock.decrement('quantity', { by: absQty, transaction: t });
-                }
-            } else if (isIncrease) {
-                await ProductStock.create({
-                    productId,
-                    warehouseId,
-                    quantity: absQty,
-                    status: 'ACTIVE'
-                }, { transaction: t });
-            } else {
-                throw new Error(`Stock record not found for product ID ${productId}`);
-            }
-            // 3. Create Movement Record for Live Stock feed
-            const { Movement } = require('../models');
-            await Movement.create({
-                companyId: user.companyId,
-                type: isIncrease ? 'INCREASE' : 'DECREASE',
-                productId,
-                warehouseId,
-                toLocationId: stock ? stock.locationId : null,
-                quantity: absQty,
-                reason,
-                createdBy: user.id
-            }, { transaction: t });
-        };
-
-        // 1. Decrease stock for ingredients
-        for (const item of order.ProductionOrderItems) {
-            if (item.quantityPicked > 0) {
-                await adjustStock(
-                    item.productId,
-                    order.warehouseId,
-                    -item.quantityPicked,
-                    'DECREASE',
-                    `Consumed for Production Order #${order.id}`
-                );
-            }
-        }
-
-        // 2. Increase stock for final product
-        const warehouseService = require('./warehouseService');
-        await warehouseService.validateCapacity(order.warehouseId, order.quantityGoal, { transaction: t });
-
+        // STEP: Add Finished Product (STOCK IN)
         await adjustStock(
+            user.companyId,
+            user.id,
             order.productId,
             order.warehouseId,
-            order.quantityGoal,
-            'INCREASE',
-            `Produced from Production Order #${order.id}`
+            parseFloat(order.quantityGoal),
+            `Produced from Production Order #${order.id}`,
+            order.id,
+            t
         );
 
         order.status = 'COMPLETED';
         order.quantityProduced = order.quantityGoal;
+        order.completionDate = new Date();
         await order.save({ transaction: t });
 
         return order;
@@ -193,6 +300,7 @@ async function complete(orderId, user) {
 module.exports = {
     list,
     create,
-    pickIngredient,
+    validateStock,
+    startProduction,
     complete
 };

@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const reportService = require('./reportService');
-const { Report } = require('../models');
+const notificationService = require('./notificationService');
+const { Report, Company } = require('../models');
 const { Op } = require('sequelize');
 const dayjs = require('dayjs');
 
@@ -14,8 +15,9 @@ function init() {
 
     // Also run every hour to catch any missed or recently added schedules
     cron.schedule('0 * * * *', async () => {
-        console.log('[CRON] Checking for scheduled reports...');
+        console.log('[CRON] Checking for scheduled reports and low stock alerts...');
         await processScheduledReports();
+        await processLowStockAlerts();
     });
 }
 
@@ -84,6 +86,17 @@ async function processScheduledReports() {
         }
     } catch (err) {
         console.error('[CRON] Error processing scheduled reports:', err);
+    }
+}
+
+async function processLowStockAlerts() {
+    try {
+        const companies = await Company.findAll({ where: { status: 'ACTIVE' }, attributes: ['id'] });
+        for (const company of companies) {
+            await notificationService.checkLowStockAndNotify(company.id);
+        }
+    } catch (err) {
+        console.error('[CRON] Error processing low stock alerts:', err);
     }
 }
 

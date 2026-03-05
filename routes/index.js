@@ -3,6 +3,7 @@ const router = express.Router();
 const authRoutes = require('./auth');
 const superadminRoutes = require('../modules/superadmin/routes');
 const superadminController = require('../controllers/superadminController');
+const notificationController = require('../controllers/notificationController');
 const { authenticate, requireSuperAdmin, requireRole } = require('../middlewares/auth');
 const companyRoutes = require('../modules/company/routes');
 const userRoutes = require('../modules/users/routes');
@@ -49,5 +50,10 @@ router.use('/api/goods-receiving', goodsReceivingRoutes);
 router.use('/api/replenishment', replenishmentRoutes);
 router.use('/api/returns', returnRoutes);
 router.use('/api/vat-codes', vatCodeRoutes);
+
+// Notifications
+router.get('/api/notifications', authenticate, notificationController.list);
+router.put('/api/notifications/:id/read', authenticate, notificationController.markAsRead);
+router.put('/api/notifications/read-all', authenticate, notificationController.markAllAsRead);
 
 module.exports = router;

@@ -18,14 +18,23 @@ const ProductionOrderItem = sequelize.define('ProductionOrderItem', {
         field: 'product_id'
     },
     quantityRequired: {
-        type: DataTypes.INTEGER,
+        type: DataTypes.DECIMAL(12, 4),
         defaultValue: 0,
         field: 'quantity_required'
     },
     quantityPicked: {
-        type: DataTypes.INTEGER,
+        type: DataTypes.DECIMAL(12, 4),
         defaultValue: 0,
         field: 'quantity_picked'
+    },
+    unit: {
+        type: DataTypes.STRING,
+        allowNull: true
+    },
+    warehouseId: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+        field: 'warehouse_id'
     }
 }, {
     tableName: 'production_order_items',

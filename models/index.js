@@ -32,6 +32,9 @@ const Return = require('./Return');
 const VatCode = require('./VatCode');
 const ProductionOrder = require('./ProductionOrder');
 const ProductionOrderItem = require('./ProductionOrderItem');
+const ProductionFormula = require('./ProductionFormula');
+const ProductionFormulaItem = require('./ProductionFormulaItem');
+const Notification = require('./Notification');
 
 // Company
 Company.hasMany(User, { foreignKey: 'companyId' });
@@ -211,6 +214,25 @@ ProductionOrderItem.belongsTo(ProductionOrder, { foreignKey: 'productionOrderId'
 Product.hasMany(ProductionOrderItem, { foreignKey: 'productId' });
 ProductionOrderItem.belongsTo(Product, { foreignKey: 'productId' });
 
+// Formula Relationships
+Product.hasMany(ProductionFormula, { foreignKey: 'productId' });
+ProductionFormula.belongsTo(Product, { foreignKey: 'productId' });
+
+ProductionFormula.hasMany(ProductionFormulaItem, { foreignKey: 'formulaId' });
+ProductionFormulaItem.belongsTo(ProductionFormula, { foreignKey: 'formulaId' });
+
+ProductionFormulaItem.belongsTo(Product, { foreignKey: 'productId' });
+Product.hasMany(ProductionFormulaItem, { foreignKey: 'productId' });
+
+ProductionOrder.belongsTo(ProductionFormula, { foreignKey: 'formulaId' });
+ProductionFormula.hasMany(ProductionOrder, { foreignKey: 'formulaId' });
+
+// Notifications
+Company.hasMany(Notification, { foreignKey: 'companyId' });
+Notification.belongsTo(Company, { foreignKey: 'companyId' });
+User.hasMany(Notification, { foreignKey: 'userId' });
+Notification.belongsTo(User, { foreignKey: 'userId' });
+
 module.exports = {
   sequelize,
   User,
@@ -246,4 +268,7 @@ module.exports = {
   VatCode,
   ProductionOrder,
   ProductionOrderItem,
+  ProductionFormula,
+  ProductionFormulaItem,
+  Notification,
 };
