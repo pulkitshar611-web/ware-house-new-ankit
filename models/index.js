@@ -221,8 +221,8 @@ ProductionFormula.belongsTo(Product, { foreignKey: 'productId' });
 ProductionFormula.hasMany(ProductionFormulaItem, { foreignKey: 'formulaId' });
 ProductionFormulaItem.belongsTo(ProductionFormula, { foreignKey: 'formulaId' });
 
-ProductionFormulaItem.belongsTo(Product, { foreignKey: 'productId' });
-Product.hasMany(ProductionFormulaItem, { foreignKey: 'productId' });
+ProductionFormulaItem.belongsTo(Product, { foreignKey: 'productId', as: 'RawMaterial' });
+Product.hasMany(ProductionFormulaItem, { foreignKey: 'productId', as: 'FormulaUsage' });
 
 ProductionOrder.belongsTo(ProductionFormula, { foreignKey: 'formulaId' });
 ProductionFormula.hasMany(ProductionOrder, { foreignKey: 'formulaId' });

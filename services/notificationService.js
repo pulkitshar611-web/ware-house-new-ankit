@@ -72,10 +72,11 @@ async function checkLowStockAndNotify(companyId) {
             const existing = await Notification.findOne({
                 where: {
                     companyId,
+                    userId: null, // Company-wide alerts
                     type: 'warning',
                     isRead: false,
                     title: 'Low Stock Alert',
-                    message: { [Op.like]: `%${p.sku}%` }
+                    message: { [Op.like]: `%(${p.sku})%` }
                 }
             });
 

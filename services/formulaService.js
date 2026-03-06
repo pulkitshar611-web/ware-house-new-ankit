@@ -7,7 +7,7 @@ async function list(user, query = {}) {
             { model: Product },
             {
                 model: ProductionFormulaItem,
-                include: [{ model: Product }]
+                include: [{ model: Product, as: 'RawMaterial' }]
             }
         ],
         order: [['createdAt', 'DESC']]
@@ -17,7 +17,7 @@ async function list(user, query = {}) {
 async function getByProductId(productId, user) {
     return await ProductionFormula.findOne({
         where: { companyId: user.companyId, productId },
-        include: [{ model: ProductionFormulaItem, include: [Product] }]
+        include: [{ model: ProductionFormulaItem, include: [{ model: Product, as: 'RawMaterial' }] }]
     });
 }
 

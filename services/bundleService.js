@@ -63,6 +63,7 @@ async function create(data, reqUser) {
     description: data.description || null,
     costPrice: data.costPrice ?? 0,
     sellingPrice: data.sellingPrice ?? 0,
+    currency: data.currency || 'USD',
     status: data.status || 'ACTIVE',
   });
   const items = Array.isArray(data.bundleItems) ? data.bundleItems.filter(i => i.productId && i.quantity > 0) : [];
@@ -82,6 +83,7 @@ async function update(id, data, reqUser) {
     description: data.description !== undefined ? data.description : bundle.description,
     costPrice: data.costPrice !== undefined ? data.costPrice : bundle.costPrice,
     sellingPrice: data.sellingPrice !== undefined ? data.sellingPrice : bundle.sellingPrice,
+    currency: data.currency !== undefined ? data.currency : bundle.currency,
     status: data.status ?? bundle.status,
   });
   if (Array.isArray(data.bundleItems)) {

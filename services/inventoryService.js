@@ -143,6 +143,7 @@ async function createProduct(data, reqUser) {
     priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
     supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
     alternativeSkus: Array.isArray(data.alternativeSkus) ? data.alternativeSkus : null,
+    currency: data.currency || (reqUser.currencyPreference) || 'USD',
   };
   console.log('[DEBUG_SERVICE] Creating Product Payload:', JSON.stringify(payload, null, 2));
   const created = await Product.create(payload);
@@ -244,6 +245,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
         priceLists: null,
         supplierProducts: null,
         alternativeSkus: null,
+        currency: data.currency || 'USD',
       });
       results.created++;
     } catch (err) {
@@ -297,6 +299,7 @@ async function updateProduct(id, data, reqUser) {
   if (data.priceLists !== undefined) upd.priceLists = data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : product.priceLists;
   if (data.supplierProducts !== undefined) upd.supplierProducts = Array.isArray(data.supplierProducts) ? data.supplierProducts : product.supplierProducts;
   if (data.alternativeSkus !== undefined) upd.alternativeSkus = Array.isArray(data.alternativeSkus) ? data.alternativeSkus : product.alternativeSkus;
+  if (data.currency !== undefined) upd.currency = data.currency;
   if (Object.keys(upd).length === 0) return normalizeProductJson(product);
   console.log('[DEBUG_SERVICE] Final Update Object:', JSON.stringify(upd, null, 2));
   await product.update(upd);
@@ -688,13 +691,14 @@ async function createAdjustment(data, reqUser) {
       const firstWarehouse = await Warehouse.findOne({ where: { companyId: effectiveCompanyId } });
       if (!firstWarehouse) throw new Error('No warehouse found for company');
       warehouseId = firstWarehouse.id;
-      await ProductStock.create({
-        productId: data.productId,
-        warehouseId,
-        quantity: qty,
-        reserved: 0,
-      });
     }
+    // Create new stock record if it doesn't exist for this warehouse
+    await ProductStock.create({
+      productId: productId,
+      warehouseId,
+      quantity: qty,
+      reserved: 0,
+    });
   }
   await adjustment.update({ status: 'COMPLETED' });
 

@@ -38,7 +38,7 @@ const Product = sequelize.define('Product', {
   priceLists: { type: DataTypes.JSON, allowNull: true },
   supplierProducts: { type: DataTypes.JSON, allowNull: true },
   alternativeSkus: { type: DataTypes.JSON, allowNull: true },
-  currency: { type: DataTypes.STRING, defaultValue: 'EUR', allowNull: true },
+  currency: { type: DataTypes.STRING, defaultValue: 'USD', allowNull: true },
 }, {
   tableName: 'products',
   timestamps: true,

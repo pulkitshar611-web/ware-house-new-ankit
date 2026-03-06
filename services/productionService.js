@@ -276,6 +276,27 @@ async function complete(orderId, user) {
         if (!order) throw new Error('Production order not found');
         if (order.status === 'COMPLETED') throw new Error('Order already completed');
 
+        // FOOLPROOF: If production was never officially "STARTED", deduct materials now
+        if (order.status !== 'IN_PRODUCTION') {
+            const stockCheck = await validateStock(orderId, user, t);
+            if (!stockCheck.allAvailable) {
+                throw new Error('Cannot complete: Insufficient stock for materials and production was not "Started".');
+            }
+            // Deduct Raw Materials now
+            for (const item of order.ProductionOrderItems) {
+                await adjustStock(
+                    user.companyId,
+                    user.id,
+                    item.productId,
+                    item.warehouseId,
+                    -parseFloat(item.quantityRequired || 0),
+                    `Consumed for Production Order #${order.id} (Auto-deducted at completion)`,
+                    order.id,
+                    t
+                );
+            }
+        }
+
         // STEP: Add Finished Product (STOCK IN)
         await adjustStock(
             user.companyId,

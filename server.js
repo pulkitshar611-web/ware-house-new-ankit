@@ -192,6 +192,23 @@ async function start() {
       console.error('[Migration Error] Critical failure adding is_production to warehouses:', migrationErr);
     }
 
+    // Safe migration: ensure unit_of_measure column exists in products
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDescription = await queryInterface.describeTable('products');
+      if (!tableDescription.unit_of_measure && !tableDescription.unitOfMeasure) {
+        console.log('[Migration] Column unit_of_measure not found in products, attempting to add...');
+        await queryInterface.addColumn('products', 'unit_of_measure', {
+          type: require('sequelize').DataTypes.STRING,
+          allowNull: true,
+          defaultValue: 'pcs',
+        });
+        console.log('[Migration] Added unit_of_measure column to products table.');
+      }
+    } catch (migrationErr) {
+      console.error('[Migration Error] Failure adding unit_of_measure to products:', migrationErr.message);
+    }
+
     // Safe migration: ensure currency column exists in products
     try {
       const queryInterface = sequelize.getQueryInterface();
@@ -201,7 +218,7 @@ async function start() {
         await queryInterface.addColumn('products', 'currency', {
           type: require('sequelize').DataTypes.STRING,
           allowNull: true,
-          defaultValue: 'EUR',
+          defaultValue: 'USD',
         });
         console.log('[Migration] Added currency column to products table.');
       } else {
