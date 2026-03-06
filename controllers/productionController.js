@@ -50,10 +50,20 @@ async function complete(req, res, next) {
     }
 }
 
+async function remove(req, res, next) {
+    try {
+        const data = await productionService.remove(req.params.id, req.user);
+        res.json({ success: true, data });
+    } catch (err) {
+        res.status(400).json({ success: false, message: err.message });
+    }
+}
+
 module.exports = {
     list,
     create,
     validateStock,
     startProduction,
-    complete
+    complete,
+    remove
 };

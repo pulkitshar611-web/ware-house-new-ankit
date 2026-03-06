@@ -318,10 +318,34 @@ async function complete(orderId, user) {
     });
 }
 
+async function remove(orderId, user) {
+    const order = await ProductionOrder.findByPk(orderId);
+    if (!order) throw new Error('Production order not found');
+    if (order.companyId !== user.companyId) throw new Error('Unauthorized');
+
+    // Disallow deleting completed orders to maintain inventory integrity
+    if (order.status === 'COMPLETED') {
+        throw new Error('Completed orders cannot be deleted. If you need to fix stock, use Inventory Adjustments.');
+    }
+
+    return await sequelize.transaction(async (t) => {
+        // Delete all items first
+        await ProductionOrderItem.destroy({
+            where: { productionOrderId: orderId },
+            transaction: t
+        });
+
+        // Delete the order
+        await order.destroy({ transaction: t });
+        return { success: true };
+    });
+}
+
 module.exports = {
     list,
     create,
     validateStock,
     startProduction,
-    complete
+    complete,
+    remove
 };

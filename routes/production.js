@@ -19,5 +19,6 @@ router.post('/', authenticate, requireRole(...prodRoles), productionController.c
 router.post('/:id/validate-stock', authenticate, requireRole(...prodRoles), productionController.validateStock);
 router.post('/:id/start', authenticate, requireRole(...prodRoles), productionController.startProduction);
 router.post('/:id/complete', authenticate, requireRole(...prodRoles), productionController.complete);
+router.delete('/:id', authenticate, requireRole(...prodRoles), productionController.remove);
 
 module.exports = router;
