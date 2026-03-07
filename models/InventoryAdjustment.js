@@ -12,7 +12,7 @@ const InventoryAdjustment = sequelize.define('InventoryAdjustment', {
     allowNull: false,
     validate: { isIn: [['INCREASE', 'DECREASE']] },
   },
-  quantity: { type: DataTypes.INTEGER, allowNull: false },
+  quantity: { type: DataTypes.DECIMAL(12, 3), allowNull: false },
   reason: { type: DataTypes.STRING, allowNull: true },
   notes: { type: DataTypes.TEXT, allowNull: true },
   status: {

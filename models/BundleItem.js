@@ -5,7 +5,7 @@ const BundleItem = sequelize.define('BundleItem', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   bundleId: { type: DataTypes.INTEGER, allowNull: false },
   productId: { type: DataTypes.INTEGER, allowNull: false },
-  quantity: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 1 },
+  quantity: { type: DataTypes.DECIMAL(12, 3), allowNull: false, defaultValue: 1 },
 }, {
   tableName: 'bundle_items',
   timestamps: true,

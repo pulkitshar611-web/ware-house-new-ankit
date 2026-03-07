@@ -311,6 +311,42 @@ async function start() {
       console.warn('[Migration Warning] Could not update production_order_items:', err.message);
     }
 
+    // Safe migration: ensure quantities are DECIMAL across all tables
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const migrations = [
+        { table: 'product_stocks', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'product_stocks', col: 'reserved', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'inventory_adjustments', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'movements', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'order_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'purchase_order_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'batches', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'batches', col: 'reserved', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'pick_list_items', col: 'quantity_required', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'pick_list_items', col: 'quantity_picked', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+        { table: 'bundle_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
+      ];
+
+      for (const m of migrations) {
+        try {
+          const tableDesc = await queryInterface.describeTable(m.table);
+          if (tableDesc[m.col] && (tableDesc[m.col].type.includes('INT') || tableDesc[m.col].type.includes('INTEGER'))) {
+            console.log(`[Migration] Changing ${m.table}.${m.col} to DECIMAL(12,3)...`);
+            await queryInterface.changeColumn(m.table, m.col, {
+              type: m.type,
+              allowNull: true, // Allow true for flexibility during migration
+              defaultValue: 0
+            });
+          }
+        } catch (err) {
+          console.warn(`[Migration Warning] Could not migrate ${m.table}.${m.col}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error('[Migration Error] Failure during quantity decimal migration:', err.message);
+    }
+
     // Safe migration: notifications table (if not handled by alter)
     try {
       const queryInterface = sequelize.getQueryInterface();

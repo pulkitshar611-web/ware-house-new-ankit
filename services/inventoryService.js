@@ -56,7 +56,7 @@ async function listProducts(reqUser, query = {}) {
     include: [
       { association: 'Category', attributes: ['id', 'name', 'code'], required: false },
       { association: 'Company', attributes: ['id', 'name', 'code'], required: false },
-      { association: 'ProductStocks', attributes: ['quantity'], required: false },
+      { association: 'ProductStocks', attributes: ['quantity', 'warehouseId'], required: false },
     ],
   });
   return products;
@@ -169,6 +169,20 @@ async function createProduct(data, reqUser) {
       type: 'INCREASE',
       quantity: openingStock,
       reason: 'Opening Stock',
+      createdBy: reqUser.id,
+    });
+
+    // [NEW] Log as Adjustment for Inventory history
+    await InventoryAdjustment.create({
+      referenceNumber: generateAdjustmentReference(),
+      companyId: payload.companyId,
+      productId: created.id,
+      warehouseId: initialWarehouseId,
+      type: 'INCREASE',
+      quantity: openingStock,
+      reason: 'Opening Stock',
+      notes: 'Initial stock added during product creation',
+      status: 'COMPLETED',
       createdBy: reqUser.id,
     });
   } else if (initialWarehouseId) {
@@ -440,6 +454,36 @@ async function createStock(data, reqUser) {
     serialNumber: data.serialNumber || null,
     bestBeforeDate: data.bestBeforeDate || null,
   });
+
+  // [NEW] Log adjustment for new stock if quantity > 0
+  if (data.quantity > 0) {
+    const qty = parseFloat(data.quantity);
+    const companyId = product.companyId;
+
+    await InventoryAdjustment.create({
+      referenceNumber: generateAdjustmentReference(),
+      companyId,
+      productId: data.productId,
+      warehouseId: data.warehouseId,
+      type: 'INCREASE',
+      quantity: qty,
+      reason: 'Initial Inventory',
+      notes: 'Added via New Stock record',
+      status: 'COMPLETED',
+      createdBy: reqUser.id,
+    });
+
+    await Movement.create({
+      companyId,
+      productId: data.productId,
+      warehouseId: data.warehouseId,
+      toLocationId: data.locationId || null,
+      type: 'INCREASE',
+      quantity: qty,
+      reason: 'Initial Inventory',
+      createdBy: reqUser.id,
+    });
+  }
   return ProductStock.findByPk(stock.id, {
     include: [
       { association: 'Product' },
@@ -452,6 +496,7 @@ async function createStock(data, reqUser) {
 async function updateStock(stockId, data, reqUser) {
   const stock = await ProductStock.findByPk(stockId, { include: ['Product'] });
   if (!stock) throw new Error('Stock not found');
+  const oldQty = parseFloat(stock.quantity || 0);
   if (reqUser.role !== 'super_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'company_admin' && reqUser.role !== 'warehouse_manager') {
     throw new Error('Not allowed');
   }
@@ -472,6 +517,39 @@ async function updateStock(stockId, data, reqUser) {
     serialNumber: data.serialNumber !== undefined ? data.serialNumber : stock.serialNumber,
     bestBeforeDate: data.bestBeforeDate !== undefined ? data.bestBeforeDate : stock.bestBeforeDate,
   });
+
+  // [NEW] Log adjustment if quantity was manually updated
+  if (data.quantity !== undefined && parseFloat(data.quantity) !== oldQty) {
+    const diff = parseFloat(data.quantity) - oldQty;
+    const type = diff > 0 ? 'INCREASE' : 'DECREASE';
+    const absDiff = Math.abs(diff);
+    const companyId = stock.Product?.companyId || reqUser.companyId;
+
+    await InventoryAdjustment.create({
+      referenceNumber: generateAdjustmentReference(),
+      companyId,
+      productId: stock.productId,
+      warehouseId: stock.warehouseId,
+      type: type,
+      quantity: absDiff,
+      reason: 'Manual Edit',
+      notes: `Stock updated from ${oldQty} to ${data.quantity} via Edit Modal`,
+      status: 'COMPLETED',
+      createdBy: reqUser.id,
+    });
+
+    await Movement.create({
+      companyId,
+      productId: stock.productId,
+      warehouseId: stock.warehouseId,
+      toLocationId: stock.locationId,
+      type: type,
+      quantity: absDiff,
+      reason: 'Manual Edit',
+      notes: `Manual inventory update from ${oldQty} to ${data.quantity}`,
+      createdBy: reqUser.id,
+    });
+  }
   return stock;
 }
 
@@ -643,7 +721,7 @@ async function createAdjustment(data, reqUser) {
   const effectiveCompanyId = companyId || product.companyId;
 
   // Auto-detect type from quantity sign if not explicitly provided
-  const rawQty = parseInt(data.quantity, 10) || 0;
+  const rawQty = parseFloat(data.quantity) || 0;
   let type;
   if (data.type && (data.type.toUpperCase() === 'INCREASE' || data.type.toUpperCase() === 'DECREASE')) {
     type = data.type.toUpperCase();
@@ -651,7 +729,7 @@ async function createAdjustment(data, reqUser) {
     type = rawQty >= 0 ? 'INCREASE' : 'DECREASE';
   }
   const qty = Math.abs(rawQty);
-  if (qty < 1) throw new Error('Quantity must be at least 1');
+  if (qty <= 0) throw new Error('Quantity must be greater than 0');
   const referenceNumber = generateAdjustmentReference();
   let warehouseId = data.warehouseId || null;
 
@@ -683,7 +761,8 @@ async function createAdjustment(data, reqUser) {
     createdBy: reqUser.id,
   });
   if (stock) {
-    const newQty = type === 'INCREASE' ? (stock.quantity || 0) + qty : Math.max(0, (stock.quantity || 0) - qty);
+    const currentQty = parseFloat(stock.quantity || 0);
+    const newQty = type === 'INCREASE' ? currentQty + qty : Math.max(0, currentQty - qty);
     await stock.update({ quantity: newQty });
   } else if (type === 'INCREASE') {
     if (!warehouseId) {
@@ -837,7 +916,7 @@ async function completeCycleCount(id, data, reqUser) {
   try {
     for (const p of products) {
       const pid = p.productId;
-      const counted = parseInt(p.countedQty, 10) || 0;
+      const counted = parseFloat(p.countedQty) || 0;
       itemsCount++;
 
       // Find current system stock
@@ -987,7 +1066,7 @@ async function createBatch(data, reqUser) {
     productId: data.productId,
     warehouseId: data.warehouseId,
     locationId: data.locationId || null,
-    quantity: parseInt(data.quantity, 10) || 0,
+    quantity: parseFloat(data.quantity) || 0,
     reserved: 0,
     unitCost: data.unitCost != null ? parseFloat(data.unitCost) : null,
     receivedDate: data.receivedDate || null,
@@ -1053,7 +1132,7 @@ async function updateBatch(id, data, reqUser) {
   await batch.update({
     batchNumber: data.batchNumber !== undefined ? data.batchNumber : batch.batchNumber,
     locationId: data.locationId !== undefined ? data.locationId : batch.locationId,
-    quantity: data.quantity !== undefined ? parseInt(data.quantity, 10) : batch.quantity,
+    quantity: data.quantity !== undefined ? parseFloat(data.quantity) : batch.quantity,
     unitCost: data.unitCost !== undefined ? (data.unitCost == null ? null : parseFloat(data.unitCost)) : batch.unitCost,
     receivedDate: data.receivedDate !== undefined ? data.receivedDate : batch.receivedDate,
     expiryDate: data.expiryDate !== undefined ? data.expiryDate : batch.expiryDate,
@@ -1134,7 +1213,7 @@ async function createMovement(data, reqUser) {
   if (!product) throw new Error('Product not found');
   if (product.companyId !== companyId && reqUser.role !== 'super_admin') throw new Error('Product not found');
 
-  const qty = parseInt(data.quantity, 10) || 0;
+  const qty = parseFloat(data.quantity) || 0;
   if (qty <= 0) throw new Error('Quantity must be greater than 0');
 
   const type = data.type || 'TRANSFER';
@@ -1293,7 +1372,7 @@ async function updateMovement(id, data, reqUser) {
     batchId: data.batchId !== undefined ? data.batchId : movement.batchId,
     fromLocationId: data.fromLocationId !== undefined ? data.fromLocationId : movement.fromLocationId,
     toLocationId: data.toLocationId !== undefined ? data.toLocationId : movement.toLocationId,
-    quantity: data.quantity !== undefined ? parseInt(data.quantity, 10) : movement.quantity,
+    quantity: data.quantity !== undefined ? parseFloat(data.quantity) : movement.quantity,
     reason: data.reason !== undefined ? data.reason : movement.reason,
     notes: data.notes !== undefined ? data.notes : movement.notes,
   });

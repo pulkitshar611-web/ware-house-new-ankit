@@ -14,7 +14,7 @@ const Movement = sequelize.define('Movement', {
   fromLocationId: { type: DataTypes.INTEGER, allowNull: true },
   toLocationId: { type: DataTypes.INTEGER, allowNull: true },
   warehouseId: { type: DataTypes.INTEGER, allowNull: true },
-  quantity: { type: DataTypes.INTEGER, allowNull: false },
+  quantity: { type: DataTypes.DECIMAL(12, 3), allowNull: false },
   reason: { type: DataTypes.STRING, allowNull: true },
   notes: { type: DataTypes.TEXT, allowNull: true },
   createdBy: { type: DataTypes.INTEGER, allowNull: true },
