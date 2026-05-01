@@ -1,5 +1,6 @@
-const { Shipment, SalesOrder, OrderItem, PickList, ProductStock, User, Company, Warehouse } = require('../models');
+const { Shipment, SalesOrder, OrderItem, PickList, ProductStock, User, Company, Warehouse, sequelize } = require('../models');
 const { Op } = require('sequelize');
+const inventoryService = require('./inventoryService');
 
 async function list(reqUser, query = {}) {
   const where = {};
@@ -80,60 +81,38 @@ async function update(id, data, reqUser) {
   if (data.deliveryStatus === 'SHIPPED' || data.deliveryStatus === 'IN_TRANSIT') {
     await order.update({ status: 'SHIPPED' });
   } else if (data.deliveryStatus === 'DELIVERED') {
-    await order.update({ status: 'DELIVERED' });
+    await order.update({ status: 'COMPLETED' });
   } else if (data.deliveryStatus === 'FAILED' || data.deliveryStatus === 'RETURNED') {
     await order.update({ status: 'SHIPPED' });
   }
 
   // Shipped/Delivered hone ke baad inventory & product stock se quantity minus (sirf ek hi bar)
-  if (becomesShippedOrDelivered && !shipment.stockDeducted) {
-    const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id } });
-    let deductionCount = 0;
+    const t = await sequelize.transaction();
+    try {
+      const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id }, transaction: t });
+      const pickList = await PickList.findOne({ where: { salesOrderId: order.id }, attributes: ['warehouseId'], transaction: t });
+      const warehouseId = pickList?.warehouseId;
 
-    for (const item of orderItems) {
-      const pid = Number(item.productId) || 0;
-      const qty = Number(item.quantity) || 0;
-      if (!pid || qty <= 0) continue;
-      try {
-        let stock = null;
-        const pickList = await PickList.findOne({ where: { salesOrderId: order.id }, attributes: ['warehouseId'] });
-        if (pickList && pickList.warehouseId) {
-          stock = await ProductStock.findOne({ where: { productId: pid, warehouseId: pickList.warehouseId } });
-        }
-        if (!stock && order.companyId) {
-          const companyWarehouses = await Warehouse.findAll({ where: { companyId: order.companyId }, attributes: ['id'] });
-          const warehouseIds = (companyWarehouses || []).map((w) => w.id);
-          if (warehouseIds.length > 0) {
-            stock = await ProductStock.findOne({
-              where: { productId: pid, warehouseId: { [Op.in]: warehouseIds } },
-            });
-          }
-        }
-        if (!stock) {
-          stock = await ProductStock.findOne({ where: { productId: pid } });
-        }
-        if (stock) {
-          const prevQty = Number(stock.quantity) || 0;
-          const prevRes = Number(stock.reserved) || 0;
-          const deductQty = Math.min(qty, prevQty);
-          if (deductQty > 0) {
-            await stock.decrement('quantity', { by: deductQty });
-            // Explicitly touch updatedAt for "Last Movement" tracking
-            await stock.update({ updatedAt: new Date() });
-            const newRes = Math.max(0, prevRes - deductQty);
-            if (newRes !== prevRes) await stock.update({ reserved: newRes });
-            deductionCount++;
-          }
-        }
-      } catch (err) {
-        console.error('Shipment stock deduct failed for product', pid, err.message);
+      if (!warehouseId) throw new Error('Cannot deduct stock: No warehouse associated with this order picklist');
+
+      for (const item of orderItems) {
+        await inventoryService.shipStock({
+          productId: item.productId,
+          companyId: order.companyId,
+          warehouseId,
+          clientId: order.customerId || null,
+          quantity: item.quantity,
+          referenceId: `SHIP:${shipment.id}`,
+          userId: reqUser.id
+        }, t);
       }
-    }
 
-    if (deductionCount > 0) {
-      await shipment.update({ stockDeducted: true });
+      await shipment.update({ stockDeducted: true }, { transaction: t });
+      await t.commit();
+    } catch (err) {
+      await t.rollback();
+      console.error('Shipment stock deduct failed:', err.message);
     }
-  }
 
   return getById(id, reqUser);
 }
@@ -153,106 +132,35 @@ async function deductStockForShipment(shipmentId, reqUser) {
   const order = await SalesOrder.findByPk(shipment.salesOrderId);
   if (!order) throw new Error('Order not found');
 
-  const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id } });
-  if (!orderItems || orderItems.length === 0) throw new Error('No order items found for this shipment. Add products to the sales order first.');
+  const t = await sequelize.transaction();
+  try {
+    const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id }, transaction: t });
+    const pickList = await PickList.findOne({ where: { salesOrderId: order.id }, attributes: ['warehouseId'], transaction: t });
+    const warehouseId = pickList?.warehouseId;
 
-  let deducted = 0;
-  for (const item of orderItems) {
-    const pid = Number(item.productId ?? item.product_id) || 0;
-    const qty = Number(item.quantity) || 0;
-    if (!pid || qty <= 0) continue;
-    try {
-      let stock = null;
-      const pickList = await PickList.findOne({ where: { salesOrderId: order.id }, attributes: ['warehouseId'] });
-      if (pickList && pickList.warehouseId) {
-        stock = await ProductStock.findOne({ where: { productId: pid, warehouseId: pickList.warehouseId } });
-      }
-      if (!stock && order.companyId) {
-        const companyWarehouses = await Warehouse.findAll({ where: { companyId: order.companyId }, attributes: ['id'] });
-        const warehouseIds = (companyWarehouses || []).map((w) => w.id);
-        if (warehouseIds.length > 0) {
-          stock = await ProductStock.findOne({ where: { productId: pid, warehouseId: { [Op.in]: warehouseIds } } });
-        }
-      }
-      if (!stock) stock = await ProductStock.findOne({ where: { productId: pid } });
-      if (stock) {
-        const prevQty = Number(stock.quantity) || 0;
-        const prevRes = Number(stock.reserved) || 0;
-        const deductQty = Math.min(qty, prevQty);
-        if (deductQty > 0) {
-          await stock.decrement('quantity', { by: deductQty });
-          // Explicitly touch updatedAt for "Last Movement" tracking
-          await stock.update({ updatedAt: new Date() });
-          const newRes = Math.max(0, prevRes - deductQty);
-          if (newRes !== prevRes) await stock.update({ reserved: newRes });
-          deducted += 1;
-        }
-      }
-    } catch (err) {
-      console.error('Deduct stock failed for product', pid, err.message);
+    if (!warehouseId) throw new Error('No warehouse associated with this order picklist');
+
+    for (const item of orderItems) {
+      await inventoryService.shipStock({
+        productId: item.productId,
+        companyId: order.companyId,
+        warehouseId,
+        clientId: order.customerId || null,
+        quantity: item.quantity,
+        referenceId: `SHIP:${shipment.id}`,
+        userId: reqUser.id
+      }, t);
     }
-  }
 
-  if (deducted > 0) {
-    await shipment.update({ stockDeducted: true });
+    await shipment.update({ stockDeducted: true }, { transaction: t });
+    await t.commit();
+    return { message: 'Stock successfully deducted for this shipment.', success: true };
+  } catch (err) {
+    await t.rollback();
+    throw err;
   }
 
   return { message: deducted > 0 ? `Stock deducted for ${deducted} product(s). Refresh Inventory/Products.` : 'No stock records found. Ensure products have inventory (Stock).', deducted };
 }
 
-async function prepareShipment(data, reqUser) {
-  const { orderNumber } = data;
-  if (!orderNumber) throw new Error('Order number required');
-
-  const order = await SalesOrder.findOne({
-    where: {
-      orderNumber: orderNumber.trim(),
-      companyId: reqUser.companyId || { [Op.ne]: null }
-    },
-    include: ['Shipment']
-  });
-
-  if (!order) throw new Error('Order not found');
-  if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
-
-  // If shipment doesn't exist, create it (assuming it's PACKED)
-  let shipment = order.Shipment;
-  if (!shipment) {
-    if (order.status !== 'PACKED' && order.status !== 'PICKED') {
-      throw new Error(`Order ${orderNumber} is in status ${order.status}. It must be PACKED or PICKED to ship.`);
-    }
-    shipment = await create({ salesOrderId: order.id }, reqUser);
-  }
-
-  // Update status to SHIPPED
-  return update(shipment.id, { deliveryStatus: 'SHIPPED' }, reqUser);
-}
-
-async function remove(id, reqUser) {
-  const shipment = await Shipment.findByPk(id);
-  if (!shipment) throw new Error('Shipment not found');
-  if (reqUser.role !== 'super_admin' && shipment.companyId !== reqUser.companyId) throw new Error('Shipment not found');
-
-  const order = await SalesOrder.findByPk(shipment.salesOrderId);
-
-  // Revert stock if deducted
-  if (shipment.stockDeducted && order) {
-    const orderItems = await OrderItem.findAll({ where: { salesOrderId: order.id } });
-    for (const item of orderItems) {
-      const stock = await ProductStock.findOne({ where: { productId: item.productId } });
-      if (stock) {
-        await stock.increment('quantity', { by: item.quantity });
-        await stock.increment('reserved', { by: item.quantity });
-      }
-    }
-  }
-
-  if (order) {
-    await order.update({ status: 'PACKED' });
-  }
-
-  await shipment.destroy();
-  return { message: 'Shipment deleted and order reverted' };
-}
-
-module.exports = { list, getById, create, update, deductStockForShipment, prepareShipment, remove };
+module.exports = { list, getById, create, update, deductStockForShipment };

@@ -7,9 +7,14 @@ const GoodsReceiptItem = sequelize.define('GoodsReceiptItem', {
   productId: { type: DataTypes.INTEGER, allowNull: false },
   productName: { type: DataTypes.STRING, allowNull: true },
   productSku: { type: DataTypes.STRING, allowNull: true },
-  expectedQty: { type: DataTypes.INTEGER, defaultValue: 0 },
-  receivedQty: { type: DataTypes.INTEGER, defaultValue: 0 },
-  qualityStatus: { type: DataTypes.STRING, allowNull: true }, // GOOD, DAMAGED
+  expectedQty: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
+  receivedQty: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
+  qtyToBook: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
+  batchId: { type: DataTypes.STRING, allowNull: true },
+  bestBeforeDate: { type: DataTypes.DATE, allowNull: true },
+  locationId: { type: DataTypes.INTEGER, allowNull: true },
+  qualityStatus: { type: DataTypes.STRING, defaultValue: 'GOOD' }, // GOOD, DAMAGED
+  unitCost: { type: DataTypes.DECIMAL(12, 2), allowNull: true },
 }, {
   tableName: 'goods_receipt_items',
   timestamps: true,

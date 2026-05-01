@@ -4,7 +4,10 @@ const { Op } = require('sequelize');
 async function list(reqUser, query = {}) {
   const where = {};
   if (reqUser.role === 'packer') {
-    where.assignedTo = reqUser.id;
+    where[Op.or] = [
+      { assignedTo: reqUser.id },
+      { assignedTo: null }
+    ];
   }
 
   if (query.status) where.status = query.status;

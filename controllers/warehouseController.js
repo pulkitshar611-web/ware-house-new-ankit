@@ -47,14 +47,18 @@ async function remove(req, res, next) {
     res.json({ success: true, message: 'Warehouse deleted' });
   } catch (err) {
     if (err.message === 'Warehouse not found') return res.status(404).json({ success: false, message: err.message });
-    if (err.name === 'SequelizeForeignKeyConstraintError') {
-      return res.status(400).json({
-        success: false,
-        message: 'This warehouse cannot be deleted because it is currently associated with active stock, locations, or orders. Please remove secondary records first.'
-      });
-    }
     next(err);
   }
 }
 
-module.exports = { list, getById, create, update, remove };
+async function getProducts(req, res, next) {
+  try {
+    const data = await warehouseService.getProducts(req.params.id, req.user);
+    res.json({ success: true, data });
+  } catch (err) {
+    if (err.message === 'Warehouse not found') return res.status(404).json({ success: false, message: err.message });
+    next(err);
+  }
+}
+
+module.exports = { list, getById, create, update, remove, getProducts };

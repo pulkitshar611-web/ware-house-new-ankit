@@ -12,14 +12,7 @@ async function list(reqUser, query = {}) {
       { code: { [Op.like]: `%${query.search}%` } },
     ];
   }
-  const suppliers = await Supplier.findAll({
-    where,
-    include: [{
-      association: 'Products',
-      include: [{ association: 'ProductStocks' }]
-    }],
-    order: [['name']]
-  });
+  const suppliers = await Supplier.findAll({ where, order: [['name']] });
   return suppliers;
 }
 
@@ -40,6 +33,7 @@ async function create(data, reqUser) {
     email: data.email || null,
     phone: data.phone || null,
     address: data.address || null,
+    header_image_url: data.header_image_url || null,
   });
 }
 
@@ -53,6 +47,7 @@ async function update(id, data, reqUser) {
     email: data.email !== undefined ? data.email : supplier.email,
     phone: data.phone !== undefined ? data.phone : supplier.phone,
     address: data.address !== undefined ? data.address : supplier.address,
+    header_image_url: data.header_image_url !== undefined ? data.header_image_url : supplier.header_image_url,
   });
   return supplier;
 }

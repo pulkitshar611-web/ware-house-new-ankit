@@ -82,6 +82,22 @@ async function stats(req, res, next) {
       }
     }
 
+    // Out of stock: products where sum(stock) <= 0
+    let outOfStockCount = 0;
+    if (companyId) {
+      const products = await Product.findAll({
+        where: { ...baseWhere, status: 'ACTIVE' },
+        attributes: ['id'],
+      });
+      const whIds = (await Warehouse.findAll({ where: { companyId }, attributes: ['id'] })).map((w) => w.id);
+      for (const p of products) {
+        const sum = await ProductStock.sum('quantity', {
+          where: { productId: p.id, warehouseId: { [Op.in]: whIds } },
+        });
+        if ((sum || 0) <= 0) outOfStockCount += 1;
+      }
+    }
+
     res.json({
       success: true,
       data: {
@@ -93,6 +109,7 @@ async function stats(req, res, next) {
         totalOrders: counts[5],
         totalStock,
         lowStockCount,
+        outOfStockCount,
         pickingPendingCount: counts[6],
         packingPendingCount: counts[7],
       },
@@ -144,7 +161,7 @@ async function charts(req, res, next) {
     const orderItems = await OrderItem.findAll({
       include: [
         {
-          model: SalesOrder,
+          association: 'SalesOrder',
           where: {
             ...baseWhere,
             createdAt: { [Op.gte]: startDate },
@@ -269,6 +286,14 @@ async function reports(req, res, next) {
         });
         if ((sum || 0) < (p.reorderLevel || 0)) lowStockCount += 1;
       }
+      let oosCount = 0;
+      for (const p of products) {
+        const sum = await ProductStock.sum('quantity', {
+          where: { productId: p.id, warehouseId: { [Op.in]: whIds } },
+        });
+        if ((sum || 0) <= 0) oosCount += 1;
+      }
+      outOfStockCount = oosCount;
     } else {
       const result = await ProductStock.sum('quantity');
       totalStock = result || 0;
@@ -323,7 +348,7 @@ async function reports(req, res, next) {
         schedule: 'LIVE',
         format: 'PDF',
         createdAt: now,
-        metadata: { lowStockCount },
+        metadata: { lowStockCount, outOfStockCount },
       },
     ];
 

@@ -12,8 +12,8 @@ router.post('/sales', requireRole('super_admin', 'company_admin'), orderControll
 router.put('/sales/:id', requireRole('super_admin', 'company_admin'), orderController.update);
 router.delete('/sales/:id', requireRole('super_admin', 'company_admin'), orderController.remove);
 
-router.get('/customers', requireRole('super_admin', 'company_admin', 'viewer'), customerController.list);
-router.get('/customers/:id', requireRole('super_admin', 'company_admin', 'viewer'), customerController.getById);
+router.get('/customers', requireRole('super_admin', 'company_admin', 'inventory_manager', 'picker', 'packer', 'viewer'), customerController.list);
+router.get('/customers/:id', requireRole('super_admin', 'company_admin', 'inventory_manager', 'picker', 'packer', 'viewer'), customerController.getById);
 router.post('/customers', requireRole('super_admin', 'company_admin'), customerController.create);
 router.put('/customers/:id', requireRole('super_admin', 'company_admin'), customerController.update);
 router.delete('/customers/:id', requireRole('super_admin', 'company_admin'), customerController.remove);

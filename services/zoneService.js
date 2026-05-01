@@ -3,19 +3,39 @@ const { Op } = require('sequelize');
 
 async function list(reqUser, query = {}) {
   const where = {};
-  if (reqUser.role === 'company_admin' && reqUser.companyId) {
-    const whIds = await Warehouse.findAll({ where: { companyId: reqUser.companyId }, attributes: ['id'] });
-    const whIdList = whIds.map(w => w.id);
-    if (query.warehouseId) {
-      where.warehouseId = whIdList.includes(Number(query.warehouseId)) ? query.warehouseId : { [Op.in]: [] };
-    } else {
-      where.warehouseId = { [Op.in]: whIdList };
+  const qWh =
+    query.warehouseId != null && query.warehouseId !== '' ? Number(query.warehouseId) : null;
+
+  // Align with location import: scope zones by company warehouses, not only Zone.companyId
+  // (legacy rows may have companyId null while warehouse still belongs to the company).
+  if (reqUser.role === 'super_admin') {
+    if (qWh) where.warehouseId = qWh;
+  } else if (reqUser.role === 'company_admin' || reqUser.role === 'inventory_manager') {
+    if (reqUser.companyId) {
+      const companyWarehouses = await Warehouse.findAll({
+        where: { companyId: reqUser.companyId },
+        attributes: ['id'],
+      });
+      const whIds = companyWarehouses.map((w) => Number(w.id));
+      if (qWh) {
+        where.warehouseId = whIds.includes(qWh) ? qWh : { [Op.in]: [-1] };
+      } else {
+        where.warehouseId = whIds.length ? { [Op.in]: whIds } : { [Op.in]: [-1] };
+      }
+    } else if (qWh) {
+      where.warehouseId = qWh;
     }
-  } else if (reqUser.role !== 'super_admin' && reqUser.warehouseId) {
-    where.warehouseId = reqUser.warehouseId;
-  } else if (query.warehouseId) {
-    where.warehouseId = query.warehouseId;
+  } else if (reqUser.warehouseId) {
+    const wid = Number(reqUser.warehouseId);
+    if (qWh && qWh !== wid) {
+      where.warehouseId = { [Op.in]: [-1] };
+    } else {
+      where.warehouseId = qWh || wid;
+    }
+  } else if (qWh) {
+    where.warehouseId = qWh;
   }
+
   const zones = await Zone.findAll({
     where,
     order: [['createdAt', 'DESC']],
@@ -34,7 +54,14 @@ async function getById(id, reqUser) {
 
 async function create(data, reqUser) {
   if (!data.warehouseId) throw new Error('warehouseId required');
+  let companyId = reqUser.companyId;
+  if (!companyId && data.warehouseId) {
+    const wh = await Warehouse.findByPk(data.warehouseId);
+    if (wh) companyId = wh.companyId;
+  }
+
   return Zone.create({
+    companyId,
     warehouseId: data.warehouseId,
     name: data.name,
     code: data.code || null,

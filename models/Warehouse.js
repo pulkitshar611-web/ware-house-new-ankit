@@ -10,7 +10,6 @@ const Warehouse = sequelize.define('Warehouse', {
   address: { type: DataTypes.TEXT },
   phone: { type: DataTypes.STRING },
   capacity: { type: DataTypes.INTEGER },
-  isProduction: { type: DataTypes.BOOLEAN, defaultValue: false, field: 'is_production' },
   status: { type: DataTypes.STRING, defaultValue: 'ACTIVE' },
 }, {
   tableName: 'warehouses',

@@ -1,4 +1,14 @@
 const locationService = require('../services/locationService');
+const csv = require('csv-parser');
+const fs = require('fs');
+
+function detectCsvSeparator(filePath) {
+  const text = fs.readFileSync(filePath, 'utf8');
+  const firstLine = text.split(/\r?\n/).find((l) => l.trim().length > 0) || '';
+  const commas = (firstLine.match(/,/g) || []).length;
+  const semis = (firstLine.match(/;/g) || []).length;
+  return semis > commas ? ';' : ',';
+}
 
 async function list(req, res, next) {
   try {
@@ -49,4 +59,40 @@ async function remove(req, res, next) {
   }
 }
 
-module.exports = { list, getById, create, update, remove };
+async function bulkUpload(req, res, next) {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    const sep = detectCsvSeparator(req.file.path);
+    const results = [];
+    fs.createReadStream(req.file.path)
+      .pipe(
+        csv({
+          separator: sep,
+          mapHeaders: ({ header }) =>
+            String(header || '')
+              .replace(/^\uFEFF/, '')
+              .replace(/^["'\s]+|["'\s]+$/g, '')
+              .trim(),
+        })
+      )
+      .on('data', (data) => results.push(data))
+      .on('end', async () => {
+        try {
+          const importResult = await locationService.bulkCreate(results, req.user);
+          res.json(importResult);
+        } catch (err) {
+          res.status(400).json({ success: false, message: err.message });
+        } finally {
+          if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        }
+      });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { list, getById, create, update, remove, bulkUpload };
+

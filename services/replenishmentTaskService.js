@@ -103,11 +103,6 @@ async function complete(id, reqUser) {
   await fromStock.decrement('quantity', { by: qty });
 
   // 2. Increase stock at TO location (destination) – find or create
-  if (warehouseIdTo) {
-    const warehouseService = require('./warehouseService');
-    await warehouseService.validateCapacity(warehouseIdTo, qty);
-  }
-
   let toStock = await ProductStock.findOne({
     where: { productId: task.productId, locationId: task.toLocationId, warehouseId: warehouseIdTo },
   });
@@ -115,6 +110,7 @@ async function complete(id, reqUser) {
     await toStock.increment('quantity', { by: qty });
   } else {
     await ProductStock.create({
+      companyId: task.companyId,
       productId: task.productId,
       warehouseId: warehouseIdTo,
       locationId: task.toLocationId,

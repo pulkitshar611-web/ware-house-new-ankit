@@ -7,9 +7,12 @@ const PurchaseOrderItem = sequelize.define('PurchaseOrderItem', {
   productId: { type: DataTypes.INTEGER, allowNull: false },
   productName: { type: DataTypes.STRING, allowNull: true },
   productSku: { type: DataTypes.STRING, allowNull: true },
-  quantity: { type: DataTypes.DECIMAL(12, 3), allowNull: false },
+  quantity: { type: DataTypes.INTEGER, allowNull: false },
+  supplierQuantity: { type: DataTypes.INTEGER, defaultValue: 0 },
+  packSize: { type: DataTypes.INTEGER, defaultValue: 1 },
   unitPrice: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
   totalPrice: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
+
 }, {
   tableName: 'purchase_order_items',
   timestamps: true,

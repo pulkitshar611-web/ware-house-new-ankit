@@ -38,11 +38,17 @@ const Product = sequelize.define('Product', {
   priceLists: { type: DataTypes.JSON, allowNull: true },
   supplierProducts: { type: DataTypes.JSON, allowNull: true },
   alternativeSkus: { type: DataTypes.JSON, allowNull: true },
-  currency: { type: DataTypes.STRING, defaultValue: 'USD', allowNull: true },
+  packSize: { type: DataTypes.INTEGER, defaultValue: 1 },
+  bestBeforeDateWarningPeriodDays: { type: DataTypes.INTEGER, defaultValue: 0 },
 }, {
+
   tableName: 'products',
   timestamps: true,
   underscored: true,
+  indexes: [
+    { name: 'idx_products_company', fields: ['company_id'] },
+    { name: 'idx_products_sku', fields: ['sku'] },
+  ],
 });
 
 module.exports = Product;

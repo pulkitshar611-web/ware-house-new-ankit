@@ -48,8 +48,9 @@ async function create(data, reqUser) {
     postcode: data.postcode || null,
     tier: data.tier || null,
     segment: data.segment || null,
-    creditLimit: data.creditLimit != null ? Number(data.creditLimit) : null,
-    paymentTerms: data.paymentTerms || null,
+    creditLimit: data.creditLimit,
+    paymentTerms: data.paymentTerms,
+    header_image_url: data.header_image_url || null,
     status: data.status || 'ACTIVE',
   });
 }
@@ -72,8 +73,9 @@ async function update(id, data, reqUser) {
     city: data.city !== undefined ? data.city : customer.city,
     tier: data.tier !== undefined ? data.tier : customer.tier,
     segment: data.segment !== undefined ? data.segment : customer.segment,
-    creditLimit: data.creditLimit !== undefined ? (data.creditLimit == null ? null : Number(data.creditLimit)) : customer.creditLimit,
+    creditLimit: data.creditLimit !== undefined ? data.creditLimit : customer.creditLimit,
     paymentTerms: data.paymentTerms !== undefined ? data.paymentTerms : customer.paymentTerms,
+    header_image_url: data.header_image_url !== undefined ? data.header_image_url : customer.header_image_url,
     status: data.status !== undefined ? data.status : customer.status,
   };
   await customer.update(updates);

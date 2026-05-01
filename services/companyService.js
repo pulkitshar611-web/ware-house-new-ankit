@@ -41,6 +41,7 @@ async function create(data) {
     email: data.email || null,
     phone: data.phone || null,
     address: data.address || null,
+    header_image_url: data.header_image_url || null,
     status: data.status || 'ACTIVE',
   });
 }
@@ -58,6 +59,7 @@ async function update(id, data) {
     email: data.email !== undefined ? data.email : company.email,
     phone: data.phone !== undefined ? data.phone : company.phone,
     address: data.address !== undefined ? data.address : company.address,
+    header_image_url: data.header_image_url !== undefined ? data.header_image_url : company.header_image_url,
     status: data.status ?? company.status,
   });
   return company;

@@ -1,4 +1,4 @@
-const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement, sequelize } = require('../models');
+const { Product, Category, ProductStock, Warehouse, Company, Supplier, InventoryAdjustment, CycleCount, Batch, Movement, Customer, InventoryLog, Inventory, Location, sequelize } = require('../models');
 const { Op } = require('sequelize');
 
 /** Ensure product JSON fields from API are proper objects/arrays (e.g. SQLite may return strings) */
@@ -36,11 +36,68 @@ function normalizeProductJson(p) {
   return out;
 }
 
+function isTruthyYes(value) {
+  const normalized = String(value == null ? '' : value).trim().toLowerCase();
+  return normalized === 'yes' || normalized === 'true' || normalized === '1';
+}
+
+async function validateHeatSensitivePlacement({ product, locationId, actionLabel }) {
+  if (!locationId || !isTruthyYes(product?.heatSensitive)) return;
+  const location = await Location.findByPk(locationId);
+  if (!location) throw new Error('Location not found');
+  if (!isTruthyYes(location.heatSensitive)) {
+    throw new Error(`Heat-sensitive product can only be ${actionLabel} to heat-sensitive locations`);
+  }
+}
+
+async function scanBarcode(reqUser, barcode) {
+  if (!barcode) throw new Error('Invalid barcode');
+  const cleanBarcode = barcode.trim();
+  
+  const where = {
+    [Op.or]: [
+      { barcode: cleanBarcode },
+      { sku: cleanBarcode }
+    ]
+  };
+
+  if (reqUser.role !== 'super_admin') {
+    where.companyId = reqUser.companyId;
+  }
+
+  const product = await Product.findOne({
+    where,
+    include: [
+      { association: 'Category' },
+      { association: 'Company' },
+      { association: 'Supplier' },
+      { 
+        association: 'ProductStocks', 
+        include: [
+          { association: 'Warehouse' }, 
+          { association: 'Location' }
+        ] 
+      },
+      { association: 'Batches' } // Batch belongs to Product, not ProductStock
+    ]
+  });
+
+  if (!product) throw new Error('Barcode or SKU not found');
+  return normalizeProductJson(product);
+}
+
 async function listProducts(reqUser, query = {}) {
   const where = {};
   if (reqUser.role !== 'super_admin') where.companyId = reqUser.companyId;
   else if (query.companyId) where.companyId = query.companyId;
+  
   if (query.categoryId) where.categoryId = query.categoryId;
+  if (query.supplierId) {
+    where[Op.or] = [
+      { supplierId: query.supplierId },
+      { '$SupplierProducts.supplier_id$': query.supplierId }
+    ];
+  }
   if (query.status) where.status = query.status;
   if (query.search) {
     where[Op.or] = [
@@ -56,10 +113,60 @@ async function listProducts(reqUser, query = {}) {
     include: [
       { association: 'Category', attributes: ['id', 'name', 'code'], required: false },
       { association: 'Company', attributes: ['id', 'name', 'code'], required: false },
-      { association: 'ProductStocks', attributes: ['quantity', 'warehouseId'], required: false },
+      { association: 'ProductStocks', attributes: ['quantity'], required: false },
+      { 
+        association: 'SupplierProducts', 
+        required: false,
+        where: query.supplierId ? { supplierId: query.supplierId } : undefined
+      },
     ],
+    subQuery: false, // Required when using Op.or with includes
   });
   return products;
+}
+
+async function exportProductsCsv(reqUser, query = {}) {
+  const products = await listProducts(reqUser, query);
+  const headers = [
+    'SKU', 'Name', 'Barcode', 'Category', 'Supplier', 'Status', 'Price', 'Cost Price',
+    'VAT Rate', 'Weight', 'Dimensions', 'Reorder Level', 'Stock (Total)', 'Description'
+  ];
+
+  const rows = products.map(p => {
+    const totalStock = (p.ProductStocks || []).reduce((sum, s) => sum + (Number(s.quantity) || 0), 0);
+    const weight = `${p.weight || ''} ${p.weightUnit || ''}`.trim();
+    const dims = `${p.length || ''}x${p.width || ''}x${p.height || ''} ${p.dimensionUnit || ''}`.trim();
+
+    return [
+      p.sku,
+      p.name,
+      p.barcode || '',
+      p.Category?.name || '',
+      p.Supplier?.name || '',
+      p.status,
+      p.price,
+      p.costPrice,
+      p.vatRate,
+      weight,
+      dims,
+      p.reorderLevel,
+      totalStock,
+      p.description || ''
+    ];
+  });
+
+  const toCsvCell = (v) => {
+    const s = String(v ?? '');
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replaceAll('"', '""')}"`;
+    return s;
+  };
+
+  const csvContent = [
+    headers.join(','),
+    ...rows.map(line => line.map(toCsvCell).join(','))
+  ].join('\n');
+
+  return csvContent;
 }
 
 async function listCategories(reqUser, query = {}) {
@@ -86,12 +193,6 @@ async function getProductById(id, reqUser) {
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'Supplier', attributes: ['id', 'name', 'code'] },
       { association: 'ProductStocks', include: [{ association: 'Warehouse' }, { association: 'Location' }] },
-      {
-        association: 'ProductionFormulas',
-        include: [
-          { association: 'ProductionFormulaItems', include: [{ model: Product, as: 'RawMaterial', attributes: ['id', 'name', 'sku'] }] }
-        ]
-      },
     ],
   });
   if (!product) throw new Error('Product not found');
@@ -100,7 +201,7 @@ async function getProductById(id, reqUser) {
 }
 
 async function createProduct(data, reqUser) {
-  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'warehouse_manager') {
+  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager') {
     throw new Error('Not allowed to create product');
   }
   const companyId = reqUser.companyId || data.companyId;
@@ -119,7 +220,23 @@ async function createProduct(data, reqUser) {
     productType: data.productType || null,
     unitOfMeasure: data.unitOfMeasure || null,
     price: data.price ?? 0,
-    costPrice: data.costPrice != null ? data.costPrice : null,
+    costPrice: (function() {
+      // If the frontend already sent the normalized unitCost as costPrice,
+      // and we want to avoid double-division, we need to be careful.
+      // Rule: costPrice = supplierCost / packSize
+      const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
+      const packSize = data.packSize != null ? Number(data.packSize) : 1;
+      
+      // If packSize is 1, it's already a unit cost or a single item
+      if (packSize === 1) return supplierCost || null;
+      
+      // If packSize > 1, the frontend might have sent the Case Cost.
+      // But user said "Ensure only unitCost is sent". 
+      // If we strictly follow that, we should NOT divide here if it's already unit cost.
+      // Let's assume the frontend sends what it wants stored in DB.
+      return supplierCost || null;
+    })(),
+    packSize: data.packSize || 1,
     vatRate: data.vatRate != null ? data.vatRate : null,
     vatCode: data.vatCode || null,
     customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
@@ -143,64 +260,16 @@ async function createProduct(data, reqUser) {
     priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
     supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
     alternativeSkus: Array.isArray(data.alternativeSkus) ? data.alternativeSkus : null,
-    currency: data.currency || (reqUser.currencyPreference) || 'USD',
+    packSize: data.packSize != null ? Number(data.packSize) : 1,
+    bestBeforeDateWarningPeriodDays: data.bestBeforeDateWarningPeriodDays != null ? Number(data.bestBeforeDateWarningPeriodDays) : 0,
   };
   console.log('[DEBUG_SERVICE] Creating Product Payload:', JSON.stringify(payload, null, 2));
   const created = await Product.create(payload);
-
-  // [NEW] Handle Initial Stock creation if openingStock is provided
-  const openingStock = Number(data.openingStock) || 0;
-  const { initialWarehouseId, initialLocationId } = data;
-  if (openingStock > 0 && initialWarehouseId) {
-    await ProductStock.create({
-      productId: created.id,
-      warehouseId: initialWarehouseId,
-      locationId: initialLocationId || null,
-      quantity: openingStock,
-      status: 'ACTIVE',
-    });
-
-    // Log movement for Live Stock feed
-    await Movement.create({
-      companyId: payload.companyId,
-      productId: created.id,
-      warehouseId: initialWarehouseId,
-      toLocationId: initialLocationId || null,
-      type: 'INCREASE',
-      quantity: openingStock,
-      reason: 'Opening Stock',
-      createdBy: reqUser.id,
-    });
-
-    // [NEW] Log as Adjustment for Inventory history
-    await InventoryAdjustment.create({
-      referenceNumber: generateAdjustmentReference(),
-      companyId: payload.companyId,
-      productId: created.id,
-      warehouseId: initialWarehouseId,
-      type: 'INCREASE',
-      quantity: openingStock,
-      reason: 'Opening Stock',
-      notes: 'Initial stock added during product creation',
-      status: 'COMPLETED',
-      createdBy: reqUser.id,
-    });
-  } else if (initialWarehouseId) {
-    // Even if 0 stock, create the stock record so it appears in Live Stock if needed
-    await ProductStock.create({
-      productId: created.id,
-      warehouseId: initialWarehouseId,
-      locationId: initialLocationId || null,
-      quantity: 0,
-      status: 'ACTIVE',
-    });
-  }
-
   return normalizeProductJson(created);
 }
 
 async function bulkCreateProducts(productsArray, reqUser) {
-  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'warehouse_manager') {
+  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager') {
     throw new Error('Not allowed to import products');
   }
   const companyId = reqUser.companyId;
@@ -209,6 +278,29 @@ async function bulkCreateProducts(productsArray, reqUser) {
     throw new Error('No products to import');
   }
   const results = { created: 0, skipped: 0, errors: [] };
+  
+  // Cache categories for this company to reduce DB calls and handle case-insensitive matching
+  const existingCategories = await Category.findAll({ where: { companyId } });
+  const categoryMap = new Map(); // lowercase name -> ID
+  const categoryIdSet = new Set();
+  existingCategories.forEach(c => {
+    categoryMap.set(c.name.toLowerCase().trim(), c.id);
+    categoryIdSet.add(c.id);
+  });
+  console.log(`[BULK_IMPORT] CompanyId=${companyId} Found ${existingCategories.length} existing categories.`);
+
+  // Cache suppliers for this company
+  const existingSuppliers = await Supplier.findAll({ where: { companyId } });
+  const supplierMap = new Map(); // lowercase name -> ID
+  const supplierIdSet = new Set();
+  existingSuppliers.forEach(s => {
+    supplierMap.set(s.name.toLowerCase().trim(), s.id);
+    supplierIdSet.add(s.id);
+  });
+  console.log(`[BULK_IMPORT] CompanyId=${companyId} Found ${existingSuppliers.length} existing suppliers.`);
+
+
+
   for (let i = 0; i < productsArray.length; i++) {
     const data = productsArray[i];
     try {
@@ -223,11 +315,68 @@ async function bulkCreateProducts(productsArray, reqUser) {
         results.errors.push({ row: i + 1, sku: data.sku, message: 'SKU already exists' });
         continue;
       }
+
+      // Resolve categoryId (ID or Name)
+      let resolvedCategoryId = null;
+      const catInput = data.categoryId != null ? String(data.categoryId).trim() : null;
+      if (catInput !== null && catInput !== '') {
+        // If it's a numeric ID that already exists
+        if (!isNaN(catInput) && categoryIdSet.has(Number(catInput))) {
+          resolvedCategoryId = Number(catInput);
+          console.log(`[BULK_IMPORT] Row ${i+1}: Matched numeric ID ${resolvedCategoryId}`);
+        } else {
+          // Treat as Name
+          const lowerName = catInput.toLowerCase();
+          if (categoryMap.has(lowerName)) {
+            resolvedCategoryId = categoryMap.get(lowerName);
+            console.log(`[BULK_IMPORT] Row ${i+1}: Matched category name "${catInput}" to ID ${resolvedCategoryId}`);
+          } else {
+            console.log(`[BULK_IMPORT] Row ${i+1}: Category "${catInput}" NOT found. Creating...`);
+            // Auto-create category
+            const newCat = await Category.create({
+              companyId,
+              name: catInput,
+              code: catInput.replace(/\s/g, '_').toUpperCase().slice(0, 50)
+            });
+            resolvedCategoryId = newCat.id;
+            categoryMap.set(lowerName, resolvedCategoryId);
+            categoryIdSet.add(resolvedCategoryId);
+            console.log(`[BULK_IMPORT] Row ${i+1}: Created new category "${catInput}" with ID ${resolvedCategoryId}`);
+          }
+        }
+      }
+
+
+      // Resolve supplierId (ID or Name)
+      let resolvedSupplierId = null;
+      const supInput = data.supplierId != null ? String(data.supplierId).trim() : null;
+      if (supInput !== null && supInput !== '') {
+        if (!isNaN(supInput) && supplierIdSet.has(Number(supInput))) {
+          resolvedSupplierId = Number(supInput);
+        } else {
+          const lowerSup = supInput.toLowerCase();
+          if (supplierMap.has(lowerSup)) {
+            resolvedSupplierId = supplierMap.get(lowerSup);
+          } else {
+            console.log(`[BULK_IMPORT] Row ${i+1}: Supplier "${supInput}" NOT found. Creating...`);
+            const newSup = await Supplier.create({
+              companyId,
+              name: supInput,
+              code: supInput.replace(/\s/g, '_').toUpperCase().slice(0, 50)
+            });
+            resolvedSupplierId = newSup.id;
+            supplierMap.set(lowerSup, resolvedSupplierId);
+            supplierIdSet.add(resolvedSupplierId);
+          }
+        }
+      }
+
       await Product.create({
         companyId,
-        categoryId: data.categoryId != null ? data.categoryId : null,
-        supplierId: data.supplierId != null ? data.supplierId : null,
+        categoryId: resolvedCategoryId,
+        supplierId: resolvedSupplierId,
         name: String(data.name).trim(),
+
         sku: String(data.sku).trim(),
         barcode: data.barcode ? String(data.barcode).trim() : null,
         description: data.description ? String(data.description).trim() : null,
@@ -235,7 +384,12 @@ async function bulkCreateProducts(productsArray, reqUser) {
         productType: data.productType || null,
         unitOfMeasure: data.unitOfMeasure || null,
         price: data.price != null ? Number(data.price) : 0,
-        costPrice: data.costPrice != null ? Number(data.costPrice) : null,
+        costPrice: (function() {
+          const supplierCost = data.costPrice != null ? Number(data.costPrice) : 0;
+          const packSize = data.packSize != null ? Number(data.packSize) : 1;
+          return packSize > 0 ? (supplierCost / packSize) : supplierCost;
+        })(),
+        packSize: data.packSize != null ? Number(data.packSize) : 1,
         vatRate: data.vatRate != null ? Number(data.vatRate) : null,
         vatCode: data.vatCode || null,
         customsTariff: data.customsTariff != null ? String(data.customsTariff) : null,
@@ -254,12 +408,13 @@ async function bulkCreateProducts(productsArray, reqUser) {
         reorderQty: data.reorderQty != null ? Number(data.reorderQty) : null,
         maxStock: data.maxStock != null ? Number(data.maxStock) : null,
         status: data.status && String(data.status).toUpperCase() === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE',
-        images: null,
+        images: Array.isArray(data.images) ? data.images : null,
         cartons: Array.isArray(data.cartons) && data.cartons.length > 0 ? data.cartons : null,
-        priceLists: null,
-        supplierProducts: null,
-        alternativeSkus: null,
-        currency: data.currency || 'USD',
+        priceLists: data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : null,
+        supplierProducts: Array.isArray(data.supplierProducts) ? data.supplierProducts : null,
+        alternativeSkus: Array.isArray(data.alternativeSkus) ? data.alternativeSkus : null,
+        packSize: data.packSize != null ? Number(data.packSize) : 1,
+        bestBeforeDateWarningPeriodDays: data.bestBeforeDateWarningPeriodDays != null ? Number(data.bestBeforeDateWarningPeriodDays) : 0,
       });
       results.created++;
     } catch (err) {
@@ -268,6 +423,7 @@ async function bulkCreateProducts(productsArray, reqUser) {
     }
   }
   return results;
+
 }
 
 async function updateProduct(id, data, reqUser) {
@@ -290,6 +446,7 @@ async function updateProduct(id, data, reqUser) {
   if (data.unitOfMeasure !== undefined) upd.unitOfMeasure = data.unitOfMeasure;
   if (data.price !== undefined) upd.price = data.price;
   if (data.costPrice !== undefined) upd.costPrice = data.costPrice;
+  if (data.packSize !== undefined) upd.packSize = data.packSize;
   if (data.vatRate !== undefined) upd.vatRate = data.vatRate;
   if (data.vatCode !== undefined) upd.vatCode = data.vatCode;
   if (data.customsTariff !== undefined) upd.customsTariff = data.customsTariff != null ? String(data.customsTariff) : null;
@@ -313,7 +470,8 @@ async function updateProduct(id, data, reqUser) {
   if (data.priceLists !== undefined) upd.priceLists = data.priceLists && typeof data.priceLists === 'object' ? data.priceLists : product.priceLists;
   if (data.supplierProducts !== undefined) upd.supplierProducts = Array.isArray(data.supplierProducts) ? data.supplierProducts : product.supplierProducts;
   if (data.alternativeSkus !== undefined) upd.alternativeSkus = Array.isArray(data.alternativeSkus) ? data.alternativeSkus : product.alternativeSkus;
-  if (data.currency !== undefined) upd.currency = data.currency;
+  if (data.packSize !== undefined) upd.packSize = data.packSize != null ? Number(data.packSize) : product.packSize;
+  if (data.bestBeforeDateWarningPeriodDays !== undefined) upd.bestBeforeDateWarningPeriodDays = data.bestBeforeDateWarningPeriodDays != null ? Number(data.bestBeforeDateWarningPeriodDays) : product.bestBeforeDateWarningPeriodDays;
   if (Object.keys(upd).length === 0) return normalizeProductJson(product);
   console.log('[DEBUG_SERVICE] Final Update Object:', JSON.stringify(upd, null, 2));
   await product.update(upd);
@@ -323,12 +481,6 @@ async function updateProduct(id, data, reqUser) {
       { association: 'Company', attributes: ['id', 'name', 'code'] },
       { association: 'Supplier', attributes: ['id', 'name', 'code'] },
       { association: 'ProductStocks', include: [{ association: 'Warehouse' }, { association: 'Location' }] },
-      {
-        association: 'ProductionFormulas',
-        include: [
-          { association: 'ProductionFormulaItems', include: [{ model: Product, as: 'RawMaterial', attributes: ['id', 'name', 'sku'] }] }
-        ]
-      },
     ],
   });
   return normalizeProductJson(updated || product);
@@ -413,19 +565,27 @@ async function removeCategory(id, reqUser) {
 
 async function listStock(reqUser, query = {}) {
   const where = {};
+  if (reqUser.role !== 'super_admin' && reqUser.companyId) {
+    where.companyId = reqUser.companyId;
+  }
+  // Enforce client-level visibility
+  if (reqUser.clientId) {
+    where.clientId = reqUser.clientId;
+  } else if (query.clientId) {
+    where.clientId = query.clientId;
+  }
+  
   if (query.warehouseId) where.warehouseId = query.warehouseId;
   if (query.productId) where.productId = query.productId;
+  if (query.locationId) where.locationId = query.locationId;
+  if (query.batchNumber) where.batchNumber = query.batchNumber;
   const stocks = await ProductStock.findAll({
     where,
     include: [
-      {
-        association: 'Product',
-        where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined,
-        required: reqUser.role !== 'super_admin',
-        include: [{ association: 'Category', attributes: ['id', 'name'] }]
-      },
+      { association: 'Product', where: reqUser.role !== 'super_admin' ? { companyId: reqUser.companyId } : undefined, required: reqUser.role !== 'super_admin' },
       { association: 'Warehouse', include: ['Company'] },
       { association: 'Location', required: false },
+      { association: 'Client', attributes: ['id', 'name', 'code'], required: false },
     ],
   });
   return stocks;
@@ -443,6 +603,8 @@ async function createStock(data, reqUser) {
   }
 
   const stock = await ProductStock.create({
+    companyId: reqUser.companyId || product.companyId,
+    clientId: reqUser.clientId || data.clientId || null,
     productId: data.productId,
     warehouseId: data.warehouseId,
     locationId: data.locationId || null,
@@ -454,36 +616,6 @@ async function createStock(data, reqUser) {
     serialNumber: data.serialNumber || null,
     bestBeforeDate: data.bestBeforeDate || null,
   });
-
-  // [NEW] Log adjustment for new stock if quantity > 0
-  if (data.quantity > 0) {
-    const qty = parseFloat(data.quantity);
-    const companyId = product.companyId;
-
-    await InventoryAdjustment.create({
-      referenceNumber: generateAdjustmentReference(),
-      companyId,
-      productId: data.productId,
-      warehouseId: data.warehouseId,
-      type: 'INCREASE',
-      quantity: qty,
-      reason: 'Initial Inventory',
-      notes: 'Added via New Stock record',
-      status: 'COMPLETED',
-      createdBy: reqUser.id,
-    });
-
-    await Movement.create({
-      companyId,
-      productId: data.productId,
-      warehouseId: data.warehouseId,
-      toLocationId: data.locationId || null,
-      type: 'INCREASE',
-      quantity: qty,
-      reason: 'Initial Inventory',
-      createdBy: reqUser.id,
-    });
-  }
   return ProductStock.findByPk(stock.id, {
     include: [
       { association: 'Product' },
@@ -496,8 +628,7 @@ async function createStock(data, reqUser) {
 async function updateStock(stockId, data, reqUser) {
   const stock = await ProductStock.findByPk(stockId, { include: ['Product'] });
   if (!stock) throw new Error('Stock not found');
-  const oldQty = parseFloat(stock.quantity || 0);
-  if (reqUser.role !== 'super_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'company_admin' && reqUser.role !== 'warehouse_manager') {
+  if (reqUser.role !== 'super_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'company_admin') {
     throw new Error('Not allowed');
   }
   if (stock.Product.companyId !== reqUser.companyId && reqUser.role !== 'super_admin') throw new Error('Stock not found');
@@ -517,39 +648,6 @@ async function updateStock(stockId, data, reqUser) {
     serialNumber: data.serialNumber !== undefined ? data.serialNumber : stock.serialNumber,
     bestBeforeDate: data.bestBeforeDate !== undefined ? data.bestBeforeDate : stock.bestBeforeDate,
   });
-
-  // [NEW] Log adjustment if quantity was manually updated
-  if (data.quantity !== undefined && parseFloat(data.quantity) !== oldQty) {
-    const diff = parseFloat(data.quantity) - oldQty;
-    const type = diff > 0 ? 'INCREASE' : 'DECREASE';
-    const absDiff = Math.abs(diff);
-    const companyId = stock.Product?.companyId || reqUser.companyId;
-
-    await InventoryAdjustment.create({
-      referenceNumber: generateAdjustmentReference(),
-      companyId,
-      productId: stock.productId,
-      warehouseId: stock.warehouseId,
-      type: type,
-      quantity: absDiff,
-      reason: 'Manual Edit',
-      notes: `Stock updated from ${oldQty} to ${data.quantity} via Edit Modal`,
-      status: 'COMPLETED',
-      createdBy: reqUser.id,
-    });
-
-    await Movement.create({
-      companyId,
-      productId: stock.productId,
-      warehouseId: stock.warehouseId,
-      toLocationId: stock.locationId,
-      type: type,
-      quantity: absDiff,
-      reason: 'Manual Edit',
-      notes: `Manual inventory update from ${oldQty} to ${data.quantity}`,
-      createdBy: reqUser.id,
-    });
-  }
   return stock;
 }
 
@@ -578,19 +676,24 @@ async function listStockByBestBeforeDate(reqUser, query = {}) {
   const stocks = await ProductStock.findAll({
     where,
     include: [
-      { association: 'Product', where: productWhere, required: !!productWhere, attributes: ['id', 'name', 'sku', 'barcode'] },
+      { association: 'Product', where: productWhere, required: !!productWhere, attributes: ['id', 'name', 'sku'] },
       { association: 'Warehouse', attributes: ['id', 'name'] },
+      { association: 'Location', attributes: ['id', 'name', 'code'], required: false },
     ],
   });
   const byKey = {};
   for (const s of stocks) {
-    const key = `${s.productId}-${s.bestBeforeDate}`;
+    const locName = s.Location?.code || s.Location?.name || 'Unassigned';
+    const key = `${s.productId}-${s.bestBeforeDate || 'no-date'}-${s.batchNumber || 'no-batch'}-${s.warehouseId || '0'}-${s.locationId || '0'}`;
     if (!byKey[key]) {
       byKey[key] = {
         productId: s.productId,
         productName: s.Product?.name,
         productSku: s.Product?.sku,
         bestBeforeDate: s.bestBeforeDate,
+        batchNumber: s.batchNumber,
+        warehouseName: s.Warehouse?.name || '—',
+        locationName: locName,
         totalAvailable: 0,
         bbdCount: 0,
       };
@@ -598,7 +701,11 @@ async function listStockByBestBeforeDate(reqUser, query = {}) {
     byKey[key].totalAvailable += Math.max(0, (s.quantity || 0) - (s.reserved || 0));
     byKey[key].bbdCount += 1;
   }
-  return Object.values(byKey).sort((a, b) => (a.bestBeforeDate || '').localeCompare(b.bestBeforeDate || ''));
+  return Object.values(byKey).sort((a, b) => {
+    if (!a.bestBeforeDate) return 1;
+    if (!b.bestBeforeDate) return -1;
+    return a.bestBeforeDate.localeCompare(b.bestBeforeDate);
+  });
 }
 
 async function listStockByLocation(reqUser, query = {}) {
@@ -652,11 +759,6 @@ async function listAdjustments(reqUser, query = {}) {
   if (role !== 'super_admin' && reqUser.companyId) where.companyId = reqUser.companyId;
   if (query.type) where.type = query.type;
   if (query.status) where.status = query.status;
-  if (query.startDate || query.endDate) {
-    where.createdAt = {};
-    if (query.startDate) where.createdAt[Op.gte] = new Date(query.startDate + 'T00:00:00');
-    if (query.endDate) where.createdAt[Op.lte] = new Date(query.endDate + 'T23:59:59');
-  }
   if (query.search) {
     where[Op.or] = [
       { referenceNumber: { [Op.like]: `%${query.search}%` } },
@@ -667,20 +769,22 @@ async function listAdjustments(reqUser, query = {}) {
     where,
     order: [['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
+      { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
+      { association: 'Client', required: false, attributes: ['id', 'name'] },
     ],
   });
   return list.map((a) => {
     const j = a.toJSON();
     j.items = [{ product: j.Product, quantity: j.quantity }];
     j.createdBy = j.createdByUser;
-    delete j.createdByUser;
-    delete j.Product;
+    // Keep Product and User for frontend history rendering
     return j;
   });
 }
+
 
 async function createAdjustment(data, reqUser) {
   const role = (reqUser.role || '').toString().toLowerCase().replace(/-/g, '_');
@@ -690,69 +794,79 @@ async function createAdjustment(data, reqUser) {
   }
   const companyId = reqUser.companyId || data.companyId;
   if (!companyId && role !== 'super_admin') throw new Error('Company context required');
-
-  let productId = data.productId;
-  if (!productId && (data.sku || data.barcode)) {
-    const searchTerm = (data.sku || data.barcode || '').trim();
-    if (searchTerm) {
-      const p = await Product.findOne({
-        where: {
-          companyId: companyId,
-          [Op.or]: [
-            { sku: searchTerm },
-            { barcode: searchTerm },
-            // Search in alternativeSkus JSON if applicable
-            sequelize.where(
-              sequelize.fn('JSON_CONTAINS', sequelize.col('alternative_skus'), JSON.stringify(searchTerm)),
-              1
-            )
-          ]
-        }
-      });
-      if (p) productId = p.id;
-    }
-  }
-
-  if (!productId) throw new Error('Product not found');
-  const product = await Product.findByPk(productId);
+  const effectiveCompanyId = companyId || (await Product.findByPk(data.productId).then(p => p?.companyId));
+  if (!effectiveCompanyId) throw new Error('Company context required');
+  const product = await Product.findByPk(data.productId);
   if (!product) throw new Error('Product not found');
-  if (companyId && product.companyId !== companyId && role !== 'super_admin') throw new Error('Product not found');
-
-  const effectiveCompanyId = companyId || product.companyId;
+  if (effectiveCompanyId && product.companyId !== effectiveCompanyId && role !== 'super_admin') throw new Error('Product not found');
+  if (isTruthyYes(product.requireBatchTracking) && !String(data.batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for accurate tracking`);
+  }
+  if (isTruthyYes(product.perishable) && !data.bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date`);
+  }
 
   // Auto-detect type from quantity sign if not explicitly provided
-  const rawQty = parseFloat(data.quantity) || 0;
-  let type;
-  if (data.type && (data.type.toUpperCase() === 'INCREASE' || data.type.toUpperCase() === 'DECREASE')) {
-    type = data.type.toUpperCase();
-  } else {
-    type = rawQty >= 0 ? 'INCREASE' : 'DECREASE';
-  }
+  const rawQty = parseInt(data.quantity, 10) || 0;
+  const type = data.type?.toUpperCase() === 'INCREASE' || (rawQty >= 0 && data.type?.toUpperCase() !== 'DECREASE') ? 'INCREASE' : 'DECREASE';
   const qty = Math.abs(rawQty);
-  if (qty <= 0) throw new Error('Quantity must be greater than 0');
-  const referenceNumber = generateAdjustmentReference();
-  let warehouseId = data.warehouseId || null;
+  if (qty < 1) throw new Error('Quantity must be at least 1');
 
-  if (type === 'INCREASE' && warehouseId) {
+  let warehouseId = data.warehouseId || null;
+  let locationId = data.locationId || null;
+  let batchId = data.batchId || null;
+  let batchNumber = data.batchNumber || null;
+  let bestBeforeDate = data.bestBeforeDate || null;
+  let clientId = data.clientId || null;
+
+  // New requirement: Stock updates per SKU + Warehouse + Location + Batch
+  // If batchId is provided, resolve batchNumber
+  if (batchId && !batchNumber) {
+    const b = await Batch.findByPk(batchId);
+    if (b) batchNumber = b.batchNumber;
+  }
+
+  if (!warehouseId) throw new Error('Warehouse is mandatory for inventory booking');
+  if (!locationId) throw new Error('Location is mandatory to ensure stock tracking per bin');
+  if (!clientId) throw new Error('Client is mandatory for stock movement mapping');
+  if (type === 'INCREASE') {
+    await validateHeatSensitivePlacement({ product, locationId, actionLabel: 'booked' });
+  }
+
+  if (type === 'INCREASE') {
     const warehouseService = require('./warehouseService');
     await warehouseService.validateCapacity(warehouseId, qty);
   }
 
-  const stockWhere = { productId: productId };
-  if (warehouseId) stockWhere.warehouseId = warehouseId;
+  const referenceNumber = generateAdjustmentReference();
+
+  // Find exact stock record for this combination
+  const stockWhere = { 
+    productId: data.productId,
+    warehouseId: warehouseId,
+    locationId: locationId || null,
+    batchNumber: batchNumber || null,
+    clientId: clientId || null
+  };
+
   let stock = await ProductStock.findOne({ where: stockWhere });
-  if (!stock && !warehouseId) {
-    stock = await ProductStock.findOne({ where: { productId: productId } });
-    if (stock) warehouseId = stock.warehouseId;
+
+  if (type === 'DECREASE') {
+    if (!stock || (stock.quantity || 0) - (stock.reserved || 0) < qty) {
+      throw new Error('Insufficient available stock for this combination (Warehouse/Location/Batch)');
+    }
   }
-  if (type === 'DECREASE' && (!stock || (stock.quantity || 0) - (stock.reserved || 0) < qty)) {
-    throw new Error('Insufficient available stock for decrease');
-  }
+
   const adjustment = await InventoryAdjustment.create({
     referenceNumber,
     companyId: effectiveCompanyId,
-    productId: productId,
-    warehouseId: warehouseId || (stock && stock.warehouseId) || null,
+    productId: data.productId,
+    warehouseId,
+    locationId,
+    batchId,
+    batchNumber,
+    bestBeforeDate,
+    clientId,
     type,
     quantity: qty,
     reason: data.reason || null,
@@ -760,44 +874,72 @@ async function createAdjustment(data, reqUser) {
     status: 'PENDING',
     createdBy: reqUser.id,
   });
+
   if (stock) {
-    const currentQty = parseFloat(stock.quantity || 0);
-    const newQty = type === 'INCREASE' ? currentQty + qty : Math.max(0, currentQty - qty);
-    await stock.update({ quantity: newQty });
+    const newQty = type === 'INCREASE' ? (stock.quantity || 0) + qty : Math.max(0, (stock.quantity || 0) - qty);
+    await stock.update({ 
+      quantity: newQty,
+      bestBeforeDate: bestBeforeDate || stock.bestBeforeDate,
+      clientId: clientId || stock.clientId,
+      userId: reqUser.id,
+      reason: data.reason || stock.reason
+    });
   } else if (type === 'INCREASE') {
-    if (!warehouseId) {
-      const { Warehouse } = require('../models');
-      const firstWarehouse = await Warehouse.findOne({ where: { companyId: effectiveCompanyId } });
-      if (!firstWarehouse) throw new Error('No warehouse found for company');
-      warehouseId = firstWarehouse.id;
-    }
-    // Create new stock record if it doesn't exist for this warehouse
     await ProductStock.create({
-      productId: productId,
+      companyId: effectiveCompanyId,
+      productId: data.productId,
       warehouseId,
+      locationId,
+      batchNumber,
+      batchId,
       quantity: qty,
       reserved: 0,
+      bestBeforeDate,
+      clientId,
+      userId: reqUser.id,
+      reason: data.reason,
+      status: 'ACTIVE',
     });
   }
-  await adjustment.update({ status: 'COMPLETED' });
 
-  // [NEW] Log as Movement for Live Stock feed
-  await Movement.create({
-    companyId: effectiveCompanyId,
-    type: type, // INCREASE or DECREASE
-    productId: productId,
-    warehouseId: warehouseId || (stock && stock.warehouseId) || null,
-    toLocationId: stock ? stock.locationId : null,
-    quantity: qty,
-    reason: data.reason || 'Manual Adjustment',
-    notes: data.notes || `Reference: ${referenceNumber}`,
-    createdBy: reqUser.id,
+  // SYNC Inventory Table (Warehouse Level)
+  const { Inventory } = require('../models');
+  const [inv] = await Inventory.findOrCreate({
+    where: { productId: data.productId, warehouseId },
+    defaults: { quantity: 0, reservedQuantity: 0 }
   });
+  if (type === 'INCREASE') {
+    await inv.increment('quantity', { by: qty });
+  } else {
+    await inv.decrement('quantity', { by: qty });
+  }
+
+
+  // Also create a entry in InventoryLog for history
+  const { InventoryLog } = require('../models');
+  await InventoryLog.create({
+    productId: data.productId,
+    warehouseId,
+    locationId,
+    batchId,
+    batchNumber,
+    bestBeforeDate,
+    clientId,
+    userId: reqUser.id,
+    type: type === 'INCREASE' ? 'IN' : 'OUT',
+    quantity: qty,
+    reason: data.reason || (type === 'INCREASE' ? 'Stock In' : 'Stock Out'),
+    referenceId: referenceNumber
+  });
+
+  await adjustment.update({ status: 'COMPLETED' });
   return InventoryAdjustment.findByPk(adjustment.id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
+      { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
+      { association: 'Client', required: false, attributes: ['id', 'name'] },
     ],
   }).then((a) => {
     const j = a.toJSON();
@@ -807,31 +949,6 @@ async function createAdjustment(data, reqUser) {
     delete j.Product;
     return j;
   });
-}
-
-async function removeAdjustment(id, reqUser) {
-  const adj = await InventoryAdjustment.findByPk(id);
-  if (!adj) throw new Error('Adjustment not found');
-  if (reqUser.role !== 'super_admin' && adj.companyId !== reqUser.companyId) throw new Error('Adjustment not found');
-
-  // Revert stock change
-  const stock = await ProductStock.findOne({
-    where: {
-      productId: adj.productId,
-      warehouseId: adj.warehouseId || null
-    }
-  });
-
-  if (stock) {
-    if (adj.type === 'INCREASE') {
-      await stock.decrement('quantity', { by: adj.quantity });
-    } else {
-      await stock.increment('quantity', { by: adj.quantity });
-    }
-  }
-
-  await adj.destroy();
-  return { message: 'Adjustment deleted and stock reverted' };
 }
 
 async function listCycleCounts(reqUser, query = {}) {
@@ -895,7 +1012,7 @@ async function createCycleCount(data, reqUser) {
 
 
 async function completeCycleCount(id, data, reqUser) {
-  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'warehouse_manager') {
+  if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager') {
     throw new Error('Not allowed to complete cycle count');
   }
 
@@ -916,7 +1033,7 @@ async function completeCycleCount(id, data, reqUser) {
   try {
     for (const p of products) {
       const pid = p.productId;
-      const counted = parseFloat(p.countedQty) || 0;
+      const counted = parseInt(p.countedQty, 10) || 0;
       itemsCount++;
 
       // Find current system stock
@@ -992,6 +1109,7 @@ async function completeCycleCount(id, data, reqUser) {
         } else if (diff > 0) {
           await ProductStock.create({
             ...where,
+            companyId: count.companyId,
             quantity: diff,
             status: 'ACTIVE'
           }, { transaction });
@@ -1035,7 +1153,7 @@ async function listBatches(reqUser, query = {}) {
     where,
     order: [['receivedDate', 'DESC'], ['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'Supplier', required: false, attributes: ['id', 'name', 'code'] },
@@ -1060,15 +1178,22 @@ async function createBatch(data, reqUser) {
   /* 
    * [MODIFIED] Now also creates/updates ProductStock so batch inventory is live.
    */
+  const packSize = product.packSize || 1;
+  if (!packSize || packSize <= 0) {
+    throw new Error(`Invalid pack size (${packSize}) for product ${product.sku}. Please check product configuration.`);
+  }
+
+  const calculatedUnitCost = data.unitCost != null ? parseFloat(data.unitCost) : 0;
+
   const batch = await Batch.create({
     companyId,
     batchNumber: data.batchNumber || String(Date.now()),
     productId: data.productId,
     warehouseId: data.warehouseId,
     locationId: data.locationId || null,
-    quantity: parseFloat(data.quantity) || 0,
+    quantity: parseInt(data.quantity, 10) || 0,
     reserved: 0,
-    unitCost: data.unitCost != null ? parseFloat(data.unitCost) : null,
+    unitCost: calculatedUnitCost,
     receivedDate: data.receivedDate || null,
     expiryDate: data.expiryDate || null,
     manufacturingDate: data.manufacturingDate || null,
@@ -1098,6 +1223,7 @@ async function createBatch(data, reqUser) {
     } else {
       await ProductStock.create({
         ...stockWhere,
+        companyId: batch.companyId,
         quantity: stockQty,
         reserved: 0,
         status: 'ACTIVE',
@@ -1112,7 +1238,7 @@ async function createBatch(data, reqUser) {
 async function getBatchById(id, reqUser) {
   const batch = await Batch.findByPk(id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Warehouse', attributes: ['id', 'name', 'code'] },
       { association: 'Location', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'Supplier', required: false, attributes: ['id', 'name', 'code'] },
@@ -1132,7 +1258,7 @@ async function updateBatch(id, data, reqUser) {
   await batch.update({
     batchNumber: data.batchNumber !== undefined ? data.batchNumber : batch.batchNumber,
     locationId: data.locationId !== undefined ? data.locationId : batch.locationId,
-    quantity: data.quantity !== undefined ? parseFloat(data.quantity) : batch.quantity,
+    quantity: data.quantity !== undefined ? parseInt(data.quantity, 10) : batch.quantity,
     unitCost: data.unitCost !== undefined ? (data.unitCost == null ? null : parseFloat(data.unitCost)) : batch.unitCost,
     receivedDate: data.receivedDate !== undefined ? data.receivedDate : batch.receivedDate,
     expiryDate: data.expiryDate !== undefined ? data.expiryDate : batch.expiryDate,
@@ -1165,12 +1291,13 @@ async function listMovements(reqUser, query = {}) {
     where,
     order: [['createdAt', 'DESC']],
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Batch', required: false, attributes: ['id', 'batchNumber'] },
       { association: 'fromLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'toLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
+      { association: 'fromWarehouse', required: false, attributes: ['id', 'name', 'code'] },
+      { association: 'toWarehouse', required: false, attributes: ['id', 'name', 'code'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
-      { association: 'Warehouse', required: false, attributes: ['id', 'name', 'code'] },
     ],
   });
   return list.map((m) => {
@@ -1180,40 +1307,17 @@ async function listMovements(reqUser, query = {}) {
     return j;
   });
 }
+
 async function createMovement(data, reqUser) {
   if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin' && reqUser.role !== 'inventory_manager' && reqUser.role !== 'warehouse_manager') {
     throw new Error('Not allowed to create movement');
   }
   const companyId = reqUser.companyId || data.companyId;
   if (!companyId) throw new Error('Company context required');
-
-  let productId = data.productId;
-  if (!productId && (data.sku || data.barcode || data.productSku)) {
-    const searchTerm = (data.sku || data.barcode || data.productSku || '').trim();
-    if (searchTerm) {
-      const p = await Product.findOne({
-        where: {
-          companyId: companyId,
-          [Op.or]: [
-            { sku: searchTerm },
-            { barcode: searchTerm },
-            sequelize.where(
-              sequelize.fn('JSON_CONTAINS', sequelize.col('alternative_skus'), JSON.stringify(searchTerm)),
-              1
-            )
-          ]
-        }
-      });
-      if (p) productId = p.id;
-    }
-  }
-
-  if (!productId) throw new Error('Product not found');
-  const product = await Product.findByPk(productId);
+  const product = await Product.findByPk(data.productId);
   if (!product) throw new Error('Product not found');
   if (product.companyId !== companyId && reqUser.role !== 'super_admin') throw new Error('Product not found');
-
-  const qty = parseFloat(data.quantity) || 0;
+  const qty = parseInt(data.quantity, 10) || 0;
   if (qty <= 0) throw new Error('Quantity must be greater than 0');
 
   const type = data.type || 'TRANSFER';
@@ -1225,51 +1329,30 @@ async function createMovement(data, reqUser) {
     if (b) batchNumber = b.batchNumber;
   }
 
-  let fromLocationId = data.fromLocationId;
-  let toLocationId = data.toLocationId;
-
-  // Lookup locations by name/code if IDs are missing but names are provided
-  if (!fromLocationId && data.fromLocation) {
-    const loc = await (require('../models').Location).findOne({
-      where: {
-        [Op.or]: [{ name: data.fromLocation }, { code: data.fromLocation }],
-        companyId: companyId
-      }
-    });
-    if (loc) fromLocationId = loc.id;
-  }
-  if (!toLocationId && (data.toLocation || data.toLocationId)) {
-    const loc = await (require('../models').Location).findOne({
-      where: {
-        [Op.or]: [{ name: data.toLocation || data.toLocationId }, { code: data.toLocation || data.toLocationId }],
-        companyId: companyId
-      }
-    });
-    if (loc) toLocationId = loc.id;
-  }
-
-  // Fallback to default location if still missing for TRANSFER or RECEIVE
-  if ((type === 'TRANSFER' || type === 'RECEIVE') && !toLocationId) {
-    const warehouseService = require('./warehouseService');
-    const defLoc = await warehouseService.getDefaultLocation(companyId);
-    if (defLoc) toLocationId = defLoc.id;
-  }
-  if ((type === 'TRANSFER' || type === 'PICK') && !fromLocationId) {
-    // For pick/transfer, we might need to find WHERE the product actually is
-    const { ProductStock } = require('../models');
-    const stock = await ProductStock.findOne({ where: { productId: productId }, order: [['quantity', 'DESC']] });
-    if (stock) fromLocationId = stock.locationId;
-  }
-
   const transaction = await sequelize.transaction();
 
   try {
+    // Resolve warehouses from locations if provided
+    let fromWarehouseId = data.fromWarehouseId || null;
+    let toWarehouseId = data.toWarehouseId || null;
+
+    if (!fromWarehouseId && data.fromLocationId) {
+      const fl = await (require('../models').Location).findByPk(data.fromLocationId);
+      if (fl) fromWarehouseId = fl.warehouseId;
+    }
+    if (!toWarehouseId && data.toLocationId) {
+      const tl = await (require('../models').Location).findByPk(data.toLocationId);
+      if (tl) toWarehouseId = tl.warehouseId;
+    }
+
     // 1. Log the Movement
     const movement = await Movement.create({
       companyId,
       type,
-      productId,
+      productId: data.productId,
       batchId,
+      fromWarehouseId,
+      toWarehouseId,
       fromLocationId: data.fromLocationId || null,
       toLocationId: data.toLocationId || null,
       quantity: qty,
@@ -1279,6 +1362,19 @@ async function createMovement(data, reqUser) {
     }, { transaction });
 
     // 2. Adjust Stock based on Type
+    /*
+      RECEIVE/RETURN: Add to ToLocation
+      PICK: Subtract from FromLocation
+      TRANSFER: Subtract from FromLocation, Add to ToLocation
+      ADJUST: (Handled via Adjustments usually, but if used here, implies manual +/- ?)
+              Let's assume ADJUST here is just logging or behaves like Transfer if both locs exist? 
+              For safety, we will restrict ADJUST to use createAdjustment API. 
+              But if user uses this UI, we support:
+              - If only ToLocation -> Add
+              - If only FromLocation -> Subtract
+    */
+
+    // Helper to Add Stock
     const addStock = async (locId, q, batchNum) => {
       if (!locId) throw new Error('Destination location required');
       const loc = await (require('../models').Location).findByPk(locId);
@@ -1288,11 +1384,21 @@ async function createMovement(data, reqUser) {
       await warehouseService.validateCapacity(loc.warehouseId, q, { transaction });
 
       const where = {
-        productId,
-        warehouseId: loc.warehouseId,
+        productId: data.productId,
+        warehouseId: loc.warehouseId, // Use resolved warehouseId
         locationId: locId,
         batchNumber: batchNum || null
       };
+
+      // We need to resolve warehouseId efficiently. 
+      // Assuming Location belongs to a Warehouse.
+      // Optimisation: movement creates usually pass warehouse context? No, just loc IDs.
+      // Let's look up location.
+
+      // Check if stock exists
+      // Note: ProductStock unique key is usually product+warehouse+location+batch
+      // We need to be careful with "null" batchNumber in where clause if DB treats it uniquely.
+      // Sequelize "where: { batchNumber: null }" works for finding NULLs.
 
       let stock = await ProductStock.findOne({ where, transaction });
       if (stock) {
@@ -1300,19 +1406,22 @@ async function createMovement(data, reqUser) {
       } else {
         await ProductStock.create({
           ...where,
+          companyId,
           quantity: q,
           status: 'ACTIVE'
         }, { transaction });
       }
     };
 
+    // Helper to Remove Stock
     const removeStock = async (locId, q, batchNum) => {
       if (!locId) throw new Error('Source location required');
+      // Resolve warehouse from location
       const loc = await (require('../models').Location).findByPk(locId);
       if (!loc) throw new Error(`Location ${locId} not found`);
 
       const where = {
-        productId,
+        productId: data.productId,
         warehouseId: loc.warehouseId,
         locationId: locId,
         batchNumber: batchNum || null
@@ -1348,10 +1457,12 @@ async function createMovement(data, reqUser) {
 async function getMovementById(id, reqUser) {
   const movement = await Movement.findByPk(id, {
     include: [
-      { association: 'Product', attributes: ['id', 'name', 'sku'] },
+      { association: 'Product', attributes: ['id', 'name', 'sku', 'packSize'] },
       { association: 'Batch', required: false, attributes: ['id', 'batchNumber'] },
       { association: 'fromLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
       { association: 'toLocation', required: false, attributes: ['id', 'name', 'code', 'aisle', 'rack', 'shelf', 'bin'] },
+      { association: 'fromWarehouse', required: false, attributes: ['id', 'name', 'code'] },
+      { association: 'toWarehouse', required: false, attributes: ['id', 'name', 'code'] },
       { association: 'createdByUser', required: false, attributes: ['id', 'name', 'email'] },
     ],
   });
@@ -1372,7 +1483,7 @@ async function updateMovement(id, data, reqUser) {
     batchId: data.batchId !== undefined ? data.batchId : movement.batchId,
     fromLocationId: data.fromLocationId !== undefined ? data.fromLocationId : movement.fromLocationId,
     toLocationId: data.toLocationId !== undefined ? data.toLocationId : movement.toLocationId,
-    quantity: data.quantity !== undefined ? parseFloat(data.quantity) : movement.quantity,
+    quantity: data.quantity !== undefined ? parseInt(data.quantity, 10) : movement.quantity,
     reason: data.reason !== undefined ? data.reason : movement.reason,
     notes: data.notes !== undefined ? data.notes : movement.notes,
   });
@@ -1383,49 +1494,558 @@ async function removeMovement(id, reqUser) {
   const movement = await Movement.findByPk(id);
   if (!movement) throw new Error('Movement not found');
   if (reqUser.role !== 'super_admin' && movement.companyId !== reqUser.companyId) throw new Error('Movement not found');
-
-  const transaction = await sequelize.transaction();
-  try {
-    const { ProductStock } = require('../models');
-
-    // Revert logic based on type
-    const revertAdd = async (locId, q, batchNo) => {
-      const stock = await ProductStock.findOne({
-        where: { productId: movement.productId, locationId: locId, batchNumber: batchNo || null },
-        transaction
-      });
-      if (stock) await stock.decrement('quantity', { by: q, transaction });
-    };
-
-    const revertRemove = async (locId, q, batchNo) => {
-      const stock = await ProductStock.findOne({
-        where: { productId: movement.productId, locationId: locId, batchNumber: batchNo || null },
-        transaction
-      });
-      if (stock) await stock.increment('quantity', { by: q, transaction });
-    };
-
-    if (movement.type === 'RECEIVE' || movement.type === 'RETURN') {
-      await revertAdd(movement.toLocationId, movement.quantity, movement.batchNumber);
-    } else if (movement.type === 'PICK') {
-      await revertRemove(movement.fromLocationId, movement.quantity, movement.batchNumber);
-    } else if (movement.type === 'TRANSFER') {
-      await revertRemove(movement.fromLocationId, movement.quantity, movement.batchNumber);
-      await revertAdd(movement.toLocationId, movement.quantity, movement.batchNumber);
-    }
-
-    await movement.destroy({ transaction });
-    await transaction.commit();
-    return { message: 'Movement deleted and stock reverted' };
-  } catch (err) {
-    await transaction.rollback();
-    throw err;
-  }
+  await movement.destroy();
+  return { message: 'Movement deleted' };
 }
 
-module.exports = {
+async function listInventory(reqUser, query = {}) {
+  const { Inventory, Product, Warehouse } = require('../models');
+  const where = {};
+  if (query.warehouseId) where.warehouseId = query.warehouseId;
+  const productWhere = {};
+  if (reqUser.role !== 'super_admin') productWhere.companyId = reqUser.companyId;
+  if (query.search) {
+    productWhere.name = { [Op.like]: `%${query.search}%` };
+  }
+
+  const inventory = await Inventory.findAll({
+    where,
+    include: [
+      { model: Product, where: productWhere, attributes: ['id', 'name', 'sku', 'reorderLevel'] },
+      { model: Warehouse, attributes: ['id', 'name'] }
+    ]
+  });
+
+  return inventory.map(item => {
+    const status = item.quantity <= 0 ? 'Out of Stock' : (item.quantity < (item.Product?.reorderLevel || 10) ? 'Low Stock' : 'In Stock');
+    return {
+      ...item.toJSON(),
+      status,
+      availableQuantity: item.availableQuantity // VIRTUAL field
+    };
+  });
+}
+
+async function listInventoryLogs(reqUser, query = {}) {
+  const { InventoryLog, Product, Location, Customer, User, Warehouse } = require('../models');
+  const where = {};
+  if (query.warehouseId) where.warehouseId = query.warehouseId;
+  if (query.type) where.type = query.type;
+  if (query.productId) where.productId = query.productId;
+  if (query.locationId) where.locationId = query.locationId;
+  if (query.clientId) where.clientId = query.clientId;
+
+  const productWhere = {};
+  if (reqUser.role !== 'super_admin' && reqUser.companyId) {
+    productWhere.companyId = reqUser.companyId;
+  }
+
+  const logs = await InventoryLog.findAll({
+    where,
+    include: [
+      { model: Product, where: productWhere, required: true, attributes: ['id', 'name', 'sku'] },
+      { association: 'Location', required: false, attributes: ['id', 'name', 'code'] },
+      { association: 'Client', required: false, attributes: ['id', 'name'] },
+      { association: 'Warehouse', required: false, attributes: ['id', 'name'] },
+      { association: 'User', required: false, attributes: ['id', 'name', 'email'] },
+    ],
+    order: [['createdAt', 'DESC']],
+    limit: query.limit ? parseInt(query.limit) : 100
+  });
+
+  return logs.map(l => {
+    const j = l.get({ plain: true });
+    j.createdBy = j.User;
+    // For legacy logs or transfers, ensure product info is available
+    if (j.Product) {
+      j.product = j.Product; // Backend compatibility
+    }
+    if (j.type === 'TRANSFER' && j.referenceId) {
+      const m = String(j.referenceId).match(/TRANSFER:\s*(\d+):(\d+)\s*->\s*(\d+):(\d+)/i);
+      if (m) {
+        j.fromWarehouseId = Number(m[1]);
+        j.fromLocationId = Number(m[2]);
+        j.toWarehouseId = Number(m[3]);
+        j.toLocationId = Number(m[4]);
+      }
+    }
+    return j;
+  });
+}
+
+
+
+async function stockIn(data, reqUser) {
+  const { Inventory, InventoryLog, Product, ProductStock } = require('../models');
+  const { 
+    productId, warehouseId, locationId, clientId, 
+    quantity, referenceId, batchNumber, bestBeforeDate, reason 
+  } = data;
+
+  if (!clientId) throw new Error('Client is required for stock entry');
+
+  const product = await Product.findByPk(productId);
+  if (!product) throw new Error('Product not found');
+  if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
+
+  if (!String(batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for accurate tracking`);
+  }
+  if (!bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date`);
+  }
+  await validateHeatSensitivePlacement({ product, locationId, actionLabel: 'booked' });
+
+  // 1. Sync Warehouse Level Total
+  const [inventory] = await Inventory.findOrCreate({
+    where: { productId, warehouseId },
+    defaults: { quantity: 0, reservedQuantity: 0 }
+  });
+  await inventory.increment('quantity', { by: quantity });
+
+  // 2. Sync Granular Stock (Batch + Location)
+  const [stock] = await ProductStock.findOrCreate({
+    where: { 
+      productId, 
+      warehouseId, 
+      locationId: locationId || null, 
+      batchNumber: batchNumber.trim(),
+      clientId: clientId || null
+    },
+    defaults: {
+      companyId: product.companyId,
+      quantity: 0,
+      reserved: 0,
+      bestBeforeDate,
+      status: 'ACTIVE'
+    }
+  });
+  await stock.increment('quantity', { by: quantity });
+  if (stock.bestBeforeDate !== bestBeforeDate) {
+     await stock.update({ bestBeforeDate });
+  }
+  
+  // 3. Create Audit Log
+  await InventoryLog.create({
+    productId,
+    warehouseId,
+    locationId: locationId || null,
+    clientId: clientId || null,
+    type: 'IN',
+    quantity,
+    referenceId: referenceId || 'SCAN_IN',
+    batchNumber: batchNumber.trim(),
+    bestBeforeDate,
+    reason: reason || 'Scan In',
+    userId: reqUser.id
+  });
+
+  return inventory.reload();
+}
+
+async function stockOut(data, reqUser) {
+  const { Inventory, InventoryLog } = require('../models');
+  const { productId, warehouseId, quantity, referenceId } = data;
+
+  const inventory = await Inventory.findOne({
+    where: { productId, warehouseId }
+  });
+
+  const available = (inventory.quantity || 0) - (inventory.reservedQuantity || 0);
+  if (!inventory || available < quantity) {
+    throw new Error(`Insufficient available stock. Total: ${inventory.quantity}, Reserved: ${inventory.reservedQuantity}, Available: ${available}`);
+  }
+
+  await inventory.decrement('quantity', { by: quantity });
+
+  await InventoryLog.create({
+    productId,
+    warehouseId,
+    type: 'OUT',
+    quantity,
+    referenceId
+  });
+
+  return inventory.reload();
+}
+
+async function transferStock(data, reqUser) {
+  const { ProductStock, InventoryLog, sequelize } = require('../models');
+  const { productId, fromLocationId, toLocationId, clientId, quantity, batchNumber, bestBeforeDate, reason } = data;
+  
+  const fromWarehouseId = data.fromWarehouseId || data.warehouseId;
+  const toWarehouseId = data.toWarehouseId || fromWarehouseId;
+
+  if (!clientId) throw new Error('Client is required for stock transfer');
+  if (fromLocationId === toLocationId && fromWarehouseId === toWarehouseId) {
+    throw new Error('Source and destination must be different');
+  }
+
+  const qty = parseInt(quantity);
+  if (!qty || qty <= 0) throw new Error('Quantity must be greater than 0');
+  const product = await Product.findByPk(productId);
+  if (!product) throw new Error('Product not found');
+  if (reqUser.role !== 'super_admin' && product.companyId !== reqUser.companyId) throw new Error('Product not found');
+  if (!String(batchNumber || '').trim()) {
+    throw new Error(`${product.name || 'This product'} requires a Batch Number for this transfer`);
+  }
+  if (!bestBeforeDate) {
+    throw new Error(`${product.name || 'This product'} requires a Best Before (Expiry) Date for this transfer`);
+  }
+  await validateHeatSensitivePlacement({ product, locationId: toLocationId, actionLabel: 'transferred' });
+  
+  return sequelize.transaction(async (t) => {
+    // 1. Check Source
+    const sourceBaseWhere = {
+      productId,
+      warehouseId: fromWarehouseId,
+      locationId: fromLocationId,
+      clientId: clientId || null
+    };
+    let source = null;
+    if (batchNumber) {
+      source = await ProductStock.findOne({
+        where: { ...sourceBaseWhere, batchNumber },
+        transaction: t,
+      });
+    }
+    if (!source) {
+      source = await ProductStock.findOne({
+        where: sourceBaseWhere,
+        order: [['quantity', 'DESC']],
+        transaction: t,
+      });
+    }
+
+    if (!source) {
+      throw new Error('Insufficient stock in source location/warehouse');
+    }
+
+    const sourceRows = await ProductStock.findAll({
+      where: sourceBaseWhere,
+      order: [['quantity', 'DESC']],
+      transaction: t,
+    });
+    const availableTotal = sourceRows.reduce((sum, row) => sum + Math.round((Number(row.quantity) || 0) - (Number(row.reserved) || 0)), 0);
+    if (availableTotal < qty) {
+      throw new Error(`Insufficient available stock in source location for this product. Available: ${availableTotal}, Attempted: ${qty}`);
+    }
+
+    // 2. Add/Find Destination
+    const [dest, created] = await ProductStock.findOrCreate({
+      where: { 
+        productId, 
+        warehouseId: toWarehouseId, 
+        locationId: toLocationId, 
+        batchNumber: batchNumber || source.batchNumber || null 
+      },
+      defaults: { 
+        companyId: product.companyId,
+        quantity: 0, 
+        reserved: 0, 
+        clientId: clientId || source.clientId, 
+        bestBeforeDate: bestBeforeDate || source.bestBeforeDate,
+        status: 'ACTIVE'
+      },
+      transaction: t
+    });
+
+    // 3. Update Quantities (supports stock split across multiple batch rows)
+    let remaining = qty;
+    for (const row of sourceRows) {
+      if (remaining <= 0) break;
+      const rowQty = Number(row.quantity) || 0;
+      if (rowQty <= 0) continue;
+      const consume = Math.min(rowQty, remaining);
+      await row.decrement('quantity', { by: consume, transaction: t });
+      remaining -= consume;
+    }
+    await dest.increment('quantity', { by: qty, transaction: t });
+
+    // SYNC Inventory Table (Warehouse Level)
+    const { Inventory } = require('../models');
+    
+    // Decrement from source warehouse total
+    const [sourceInv] = await Inventory.findOrCreate({
+        where: { productId, warehouseId: fromWarehouseId },
+        defaults: { quantity: 0, reservedQuantity: 0 },
+        transaction: t
+    });
+    await sourceInv.decrement('quantity', { by: qty, transaction: t });
+
+    // Increment to destination warehouse total
+    const [destInv] = await Inventory.findOrCreate({
+        where: { productId, warehouseId: toWarehouseId },
+        defaults: { quantity: 0, reservedQuantity: 0 },
+        transaction: t
+    });
+    await destInv.increment('quantity', { by: qty, transaction: t });
+
+
+    // 4. Create Logs
+    const logBase = {
+      productId,
+      clientId,
+      userId: reqUser.id,
+      batchNumber,
+      bestBeforeDate: bestBeforeDate || source.bestBeforeDate,
+      referenceId: `TRANSFER: ${fromWarehouseId}:${fromLocationId} -> ${toWarehouseId}:${toLocationId}`,
+      reason: reason || 'Internal Transfer'
+    };
+
+    // Source Log (OUT)
+    await InventoryLog.create({
+      ...logBase,
+      warehouseId: fromWarehouseId,
+      locationId: fromLocationId,
+      type: 'TRANSFER',
+      quantity: -qty
+    }, { transaction: t });
+
+    // Destination Log (IN)
+    await InventoryLog.create({
+      ...logBase,
+      warehouseId: toWarehouseId,
+      locationId: toLocationId,
+      type: 'TRANSFER',
+      quantity: qty
+    }, { transaction: t });
+
+    // Create a Movement record for the transfer
+    const effectiveCompanyId = reqUser.companyId || product.companyId;
+    if (!effectiveCompanyId) throw new Error('Company context required for movement tracking');
+
+    await Movement.create({
+      companyId: effectiveCompanyId,
+      type: 'TRANSFER',
+      productId,
+      fromWarehouseId,
+      toWarehouseId,
+      fromLocationId,
+      toLocationId,
+      quantity: qty,
+      reason: reason || 'Internal Transfer',
+      createdBy: reqUser.id,
+    }, { transaction: t });
+
+    return { success: true };
+  });
+}
+
+
+async function transfer(data, reqUser) {
+  const { Inventory, InventoryLog, sequelize } = require('../models');
+  const { fromWarehouseId, toWarehouseId, productId, quantity } = data;
+
+  if (fromWarehouseId === toWarehouseId) {
+    throw new Error('Source and destination warehouses must be different');
+  }
+
+  return sequelize.transaction(async (t) => {
+    const source = await Inventory.findOne({
+      where: { productId, warehouseId: fromWarehouseId },
+      transaction: t
+    });
+
+    if (!source || source.quantity < quantity) {
+      throw new Error('Insufficient stock in source warehouse');
+    }
+
+    const [dest] = await Inventory.findOrCreate({
+      where: { productId, warehouseId: toWarehouseId },
+      defaults: { quantity: 0, reservedQuantity: 0 },
+      transaction: t
+    });
+
+    await source.decrement('quantity', { by: quantity, transaction: t });
+    await dest.increment('quantity', { by: quantity, transaction: t });
+
+    await InventoryLog.create({
+      productId,
+      warehouseId: fromWarehouseId,
+      type: 'TRANSFER',
+      quantity,
+      referenceId: `To WH: ${toWarehouseId}`
+    }, { transaction: t });
+
+    await InventoryLog.create({
+      productId,
+      warehouseId: toWarehouseId,
+      type: 'TRANSFER',
+      quantity,
+      referenceId: `From WH: ${fromWarehouseId}`
+    }, { transaction: t });
+
+    return { success: true };
+  });
+}
+
+async function reserveStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity } = data;
+
+  if (!productId || !warehouseId || !quantity || quantity <= 0) {
+    throw new Error('Missing required fields for reservation');
+  }
+
+  // 1. Find available stock rows (FIFO: order by createdAt)
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      quantity: { [Op.gt]: sequelize.col('reserved') }
+    },
+    order: [['createdAt', 'ASC']],
+    transaction: t
+  });
+
+  const totalAvailable = stockRows.reduce((sum, row) => sum + (Number(row.quantity) - Number(row.reserved)), 0);
+  if (totalAvailable < quantity) {
+    throw new Error(`Insufficient available stock for reservation. Requested: ${quantity}, Available: ${totalAvailable}`);
+  }
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const availableInRow = Number(row.quantity) - Number(row.reserved);
+    const toReserve = Math.min(availableInRow, remaining);
+    
+    await row.increment('reserved', { by: toReserve, transaction: t });
+    remaining -= toReserve;
+  }
+
+  // 2. Sync Warehouse Inventory
+  const [inv] = await Inventory.findOrCreate({
+    where: { productId, warehouseId },
+    defaults: { quantity: 0, reservedQuantity: 0 },
+    transaction: t
+  });
+  await inv.increment('reservedQuantity', { by: quantity, transaction: t });
+
+  return { success: true };
+}
+
+async function unreserveStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity } = data;
+
+  // Find reserved rows (LIFO: reverse of reserve)
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      reserved: { [Op.gt]: 0 }
+    },
+    order: [['createdAt', 'DESC']],
+    transaction: t
+  });
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const reservedInRow = Number(row.reserved);
+    const toUnreserve = Math.min(reservedInRow, remaining);
+    
+    await row.decrement('reserved', { by: toUnreserve, transaction: t });
+    remaining -= toUnreserve;
+  }
+
+  // Sync Warehouse Inventory
+  const inv = await Inventory.findOne({
+    where: { productId, warehouseId },
+    transaction: t
+  });
+  if (inv) {
+    const toDeduct = Math.min(Number(inv.reservedQuantity), quantity);
+    await inv.decrement('reservedQuantity', { by: toDeduct, transaction: t });
+  }
+
+  return { success: true };
+}
+
+async function shipStock(data, t) {
+  const { productId, companyId, warehouseId, clientId, quantity, referenceId, userId } = data;
+
+  if (!productId || !warehouseId || !quantity || quantity <= 0) {
+    throw new Error('Missing required fields for shipping');
+  }
+
+  // 1. Find stock rows. Prioritize rows with reservations for this client/product.
+  const stockRows = await ProductStock.findAll({
+    where: {
+      productId,
+      warehouseId,
+      companyId,
+      clientId: clientId || null,
+      quantity: { [Op.gt]: 0 }
+    },
+    order: [
+      [sequelize.literal('reserved DESC')], // Prioritize rows that have reservations
+      ['createdAt', 'ASC'] // Then FIFO
+    ],
+    transaction: t,
+    lock: t.LOCK.UPDATE
+  });
+
+  const totalAvailable = stockRows.reduce((sum, row) => sum + Number(row.quantity), 0);
+  if (totalAvailable < quantity) {
+    throw new Error(`Insufficient physical stock for shipment. Requested: ${quantity}, Total Physical: ${totalAvailable}`);
+  }
+
+  let remaining = quantity;
+  for (const row of stockRows) {
+    if (remaining <= 0) break;
+    const rowQty = Number(row.quantity);
+    const rowRes = Number(row.reserved);
+    const toDeduct = Math.min(rowQty, remaining);
+    
+    // Deduct from reserved as much as possible, then from free stock
+    const resDeduct = Math.min(rowRes, toDeduct);
+    
+    await row.decrement('quantity', { by: toDeduct, transaction: t });
+    if (resDeduct > 0) {
+      await row.decrement('reserved', { by: resDeduct, transaction: t });
+    }
+    
+    remaining -= toDeduct;
+  }
+
+  // 2. Sync Warehouse Inventory
+  const inv = await Inventory.findOne({
+    where: { productId, warehouseId },
+    transaction: t,
+    lock: t.LOCK.UPDATE
+  });
+  if (inv) {
+    await inv.decrement('quantity', { by: quantity, transaction: t });
+    const invResDeduct = Math.min(Number(inv.reservedQuantity), quantity);
+    if (invResDeduct > 0) {
+      await inv.decrement('reservedQuantity', { by: invResDeduct, transaction: t });
+    }
+  }
+
+  // 3. Create Log
+  await InventoryLog.create({
+    productId,
+    warehouseId,
+    clientId: clientId || null,
+    type: 'OUT',
+    quantity: -quantity,
+    referenceId: referenceId || 'SHIPMENT',
+    userId,
+    reason: 'Sales Order Shipment'
+  }, { transaction: t });
+
+  return { success: true };
+}
+
+// Standard Exports
+const inventoryService = {
   listProducts,
   listCategories,
+  scanBarcode,
   getProductById,
   createProduct,
   bulkCreateProducts,
@@ -1443,7 +2063,6 @@ module.exports = {
   listStockByLocation,
   listAdjustments,
   createAdjustment,
-  removeAdjustment,
   listCycleCounts,
   createCycleCount,
   completeCycleCount,
@@ -1457,4 +2076,16 @@ module.exports = {
   getMovementById,
   updateMovement,
   removeMovement,
+  listInventory,
+  listInventoryLogs,
+  stockIn,
+  stockOut,
+  transfer,
+  transferStock,
+  reserveStock,
+  unreserveStock,
+  shipStock,
+  exportProductsCsv,
 };
+
+module.exports = inventoryService;

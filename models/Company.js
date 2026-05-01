@@ -8,6 +8,7 @@ const Company = sequelize.define('Company', {
   email: { type: DataTypes.STRING },
   phone: { type: DataTypes.STRING },
   address: { type: DataTypes.TEXT },
+  header_image_url: { type: DataTypes.STRING },
   status: { type: DataTypes.STRING, defaultValue: 'ACTIVE', validate: { isIn: [['ACTIVE', 'INACTIVE']] } },
 }, {
   tableName: 'companies',

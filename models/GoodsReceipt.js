@@ -4,6 +4,7 @@ const { sequelize } = require('../config/db');
 const GoodsReceipt = sequelize.define('GoodsReceipt', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   companyId: { type: DataTypes.INTEGER, allowNull: false },
+  clientId: { type: DataTypes.INTEGER, allowNull: true },
   purchaseOrderId: { type: DataTypes.INTEGER, allowNull: false },
   grNumber: { type: DataTypes.STRING, allowNull: false },
   status: {
@@ -11,9 +12,18 @@ const GoodsReceipt = sequelize.define('GoodsReceipt', {
     defaultValue: 'pending',
     validate: { isIn: [['pending', 'in_progress', 'completed']] },
   },
+  warehouseId: { type: DataTypes.INTEGER, allowNull: true },
+  deliveryType: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    defaultValue: 'carton',
+    validate: { isIn: [['pallet', 'carton']] },
+  },
+  eta: { type: DataTypes.DATE, allowNull: true },
   notes: { type: DataTypes.TEXT, allowNull: true },
-  totalExpected: { type: DataTypes.INTEGER, defaultValue: 0 },
-  totalReceived: { type: DataTypes.INTEGER, defaultValue: 0 },
+  totalExpected: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
+  totalReceived: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
+  totalToBook: { type: DataTypes.DECIMAL(12, 3), defaultValue: 0 },
 }, {
   tableName: 'goods_receipts',
   timestamps: true,

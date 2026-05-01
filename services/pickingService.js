@@ -3,7 +3,16 @@ const { Op } = require('sequelize');
 
 async function list(reqUser, query = {}) {
   const where = {};
-  if (reqUser.role === 'picker') where.assignedTo = reqUser.id;
+  if (reqUser.role === 'picker') {
+    where[Op.or] = [
+      { assignedTo: reqUser.id },
+      { assignedTo: null }
+    ];
+    // If user belongs to a warehouse, filter by it too
+    if (reqUser.warehouseId) {
+      where.warehouseId = reqUser.warehouseId;
+    }
+  }
   else if (query.warehouseId) where.warehouseId = query.warehouseId;
   if (query.status) where.status = query.status;
   const orderInclude = {

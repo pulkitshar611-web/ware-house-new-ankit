@@ -6,15 +6,21 @@ const InventoryAdjustment = sequelize.define('InventoryAdjustment', {
   referenceNumber: { type: DataTypes.STRING, allowNull: true },
   companyId: { type: DataTypes.INTEGER, allowNull: false },
   productId: { type: DataTypes.INTEGER, allowNull: false },
-  warehouseId: { type: DataTypes.INTEGER, allowNull: true },
+  warehouseId: { type: DataTypes.INTEGER, allowNull: false },
   type: {
+
     type: DataTypes.STRING,
     allowNull: false,
     validate: { isIn: [['INCREASE', 'DECREASE']] },
   },
-  quantity: { type: DataTypes.DECIMAL(12, 3), allowNull: false },
+  quantity: { type: DataTypes.INTEGER, allowNull: false },
   reason: { type: DataTypes.STRING, allowNull: true },
   notes: { type: DataTypes.TEXT, allowNull: true },
+  locationId: { type: DataTypes.INTEGER, allowNull: true },
+  batchId: { type: DataTypes.INTEGER, allowNull: true },
+  batchNumber: { type: DataTypes.STRING, allowNull: true },
+  bestBeforeDate: { type: DataTypes.DATEONLY, allowNull: true },
+  clientId: { type: DataTypes.INTEGER, allowNull: true },
   status: {
     type: DataTypes.STRING,
     defaultValue: 'PENDING',

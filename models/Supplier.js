@@ -9,6 +9,7 @@ const Supplier = sequelize.define('Supplier', {
   email: { type: DataTypes.STRING },
   phone: { type: DataTypes.STRING },
   address: { type: DataTypes.TEXT },
+  header_image_url: { type: DataTypes.STRING },
 }, {
   tableName: 'suppliers',
   timestamps: true,

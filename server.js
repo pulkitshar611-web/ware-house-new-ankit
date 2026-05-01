@@ -1,7 +1,16 @@
 require('dotenv').config();
+// RESTART REQUIRED: Syncing scanBarcode implementation in inventoryService.js
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
 const path = require('path');
+
+const uploadsDir = path.join(__dirname, 'uploads');
+try {
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+} catch (_) {
+  /* multer may still work if dir exists elsewhere */
+}
 const { sequelize } = require('./models');
 const routes = require('./routes');
 const superadminController = require('./controllers/superadminController');
@@ -9,26 +18,39 @@ const purchaseOrderController = require('./controllers/purchaseOrderController')
 const goodsReceiptController = require('./controllers/goodsReceiptController');
 const orderController = require('./controllers/orderController');
 const inventoryController = require('./controllers/inventoryController');
-const { authenticate, requireSuperAdmin, requireRole } = require('./middlewares/auth');
+const { authenticate, requireSuperAdmin, requireRole, requireAdmin, requireStaff, requireClient } = require('./middlewares/auth');
 const dashboardController = require('./controllers/dashboardController');
 const reportController = require('./controllers/reportController');
 const analyticsController = require('./controllers/analyticsController');
-const shipmentController = require('./controllers/shipmentController');
-const notificationController = require('./controllers/notificationController');
-const notificationService = require('./services/notificationService');
 const cronService = require('./services/cronService');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: true, credentials: true }));
+function getBrokenMySqlTableName(err) {
+  const errno = err?.errno ?? err?.original?.errno ?? err?.parent?.errno;
+  const sql = err?.sql || err?.original?.sql || err?.parent?.sql || '';
+  if (errno !== 1932 || !sql) return null;
+
+  const match = sql.match(/SHOW\s+INDEX\s+FROM\s+`?([a-zA-Z0-9_]+)`?/i);
+  return match ? match[1] : null;
+}
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    // Allow all origins for now to fix user's Railway connection issue
+    callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+}));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-app.use((req, res, next) => {
-  console.log(`[DEBUG] ${req.method} ${req.path}`);
-  next();
-});
+app.use('/uploads', express.static(uploadsDir));
 
 // Sales orders - register FIRST so DELETE /api/orders/sales/:id never 404s
 const soRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'picker', 'packer', 'viewer'];
@@ -69,48 +91,37 @@ app.get('/api/superadmin/reports', authenticate, requireSuperAdmin, superadminCo
 // Purchase orders - explicit routes so 404 doesn't happen
 const poRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'viewer'];
 const poWriteRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'];
-app.get('/api/purchase-orders', authenticate, requireRole(...poRoles), purchaseOrderController.list);
-app.get('/api/purchase-orders/:id', authenticate, requireRole(...poRoles), purchaseOrderController.getById);
-app.post('/api/purchase-orders', authenticate, requireRole(...poWriteRoles), purchaseOrderController.create);
-app.put('/api/purchase-orders/:id', authenticate, requireRole(...poWriteRoles), purchaseOrderController.update);
-app.delete('/api/purchase-orders/:id', authenticate, requireRole(...poWriteRoles), purchaseOrderController.remove);
-app.post('/api/purchase-orders/:id/approve', authenticate, requireRole(...poWriteRoles), purchaseOrderController.approve);
+app.get('/api/purchase-orders', authenticate, requireClient, purchaseOrderController.list);
+app.get('/api/purchase-orders/:id', authenticate, requireClient, purchaseOrderController.getById);
+app.post('/api/purchase-orders', authenticate, requireStaff, purchaseOrderController.create);
+app.put('/api/purchase-orders/:id', authenticate, requireStaff, purchaseOrderController.update);
+app.delete('/api/purchase-orders/:id', authenticate, requireAdmin, purchaseOrderController.remove);
+app.post('/api/purchase-orders/:id/approve', authenticate, requireAdmin, purchaseOrderController.approve);
 
-// Goods receiving - explicit routes so 404 doesn't happen
-const grRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'viewer'];
-const grWriteRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'];
-app.get('/api/goods-receiving', authenticate, requireRole(...grRoles), goodsReceiptController.list);
-app.get('/api/goods-receiving/:id', authenticate, requireRole(...grRoles), goodsReceiptController.getById);
-app.post('/api/goods-receiving', authenticate, requireRole(...grWriteRoles), goodsReceiptController.create);
-app.put('/api/goods-receiving/:id/receive', authenticate, requireRole(...grWriteRoles), goodsReceiptController.updateReceived);
-app.delete('/api/goods-receiving/:id', authenticate, requireRole(...grWriteRoles), goodsReceiptController.remove);
+// Goods receiving - explicit routes
+app.get('/api/goods-receiving', authenticate, requireClient, goodsReceiptController.list);
+app.get('/api/goods-receiving/:id', authenticate, requireClient, goodsReceiptController.getById);
+app.post('/api/goods-receiving', authenticate, requireStaff, goodsReceiptController.create);
+app.put('/api/goods-receiving/:id/receive', authenticate, requireStaff, goodsReceiptController.updateReceived);
+app.put('/api/goods-receiving/:id/asn', authenticate, requireStaff, goodsReceiptController.updateAsnItems);
+app.post('/api/goods-receiving/:id/finalize', authenticate, requireStaff, goodsReceiptController.finalizeReceiving);
+app.delete('/api/goods-receiving/:id', authenticate, requireAdmin, goodsReceiptController.remove);
 
-const invProductRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager'];
+// CSV Management for GRN
+app.get('/api/goods-receiving/:id/csv-template', authenticate, requireStaff, goodsReceiptController.exportCsvTemplate);
+app.post('/api/goods-receiving/:id/csv-import-bbd', authenticate, requireStaff, goodsReceiptController.importCsvBbd);
+
+// Inventory products - explicit DELETE so /api/inventory/products/:id never 404s
+const invProductRoles = ['super_admin', 'company_admin', 'inventory_manager'];
 app.delete('/api/inventory/products/:id', authenticate, requireRole(...invProductRoles), inventoryController.removeProduct);
-
-// Fast Scan Undo Routes - explicitly in server.js to fix 404 issues
-const scanRoles = ['super_admin', 'company_admin', 'inventory_manager', 'warehouse_manager', 'picker', 'packer'];
-app.delete('/api/inventory/adjustments/:id', authenticate, requireRole(...scanRoles), inventoryController.removeAdjustment);
-app.delete('/api/inventory/movements/:id', authenticate, requireRole(...scanRoles), inventoryController.removeMovement);
-// Live-feed: unified adjustments + movements for Real-time Stock Monitor
-app.get('/api/inventory/live-feed', authenticate, requireRole(...scanRoles, 'viewer'), inventoryController.liveFeed);
-app.delete('/api/shipments/:id', authenticate, requireRole('super_admin', 'company_admin', 'warehouse_manager', 'packer'), shipmentController.remove);
 
 // POST /api/products/:id/alternative-skus (same handler as inventory, so client can call either path)
 app.post('/api/products/:id/alternative-skus', authenticate, requireRole(...invProductRoles), inventoryController.addAlternativeSku);
 
 const returnRoutes = require('./routes/returnRoutes');
-const productionRoutes = require('./routes/production');
-
 app.use('/api/returns', returnRoutes);
-app.use('/api/production', authenticate, productionRoutes);
 
 app.use(routes);
-
-app.use((req, res, next) => {
-  console.log(`[404 ERROR] ${req.method} ${req.url}`);
-  res.status(404).json({ success: false, message: `Route not found: ${req.method} ${req.url}` });
-});
 
 app.use((err, req, res, next) => {
   console.error(err);
@@ -124,22 +135,26 @@ app.use((err, req, res, next) => {
 
 async function start() {
   try {
-    await sequelize.authenticate();
     const dialect = sequelize.getDialect();
     if (dialect === 'sqlite') {
       const storage = sequelize.config.storage || path.join(__dirname, 'warehouse_wms.sqlite');
       const fullPath = path.isAbsolute(storage) ? storage : path.resolve(process.cwd(), storage);
-      console.log('---');
-      console.log('Database name: warehouse_wms');
-      console.log('SQLite file:', fullPath);
-      console.log('(Data yahi save hoga - IDs 1, 2, 3...)');
+      console.log('--- DB Check ---');
+      console.log('Type: SQLite');
+      console.log('File:', fullPath);
       console.log('---');
     } else {
-      console.log('---');
-      console.log('Database name:', sequelize.config.database);
-      console.log('MySQL host:', sequelize.config.host || 'localhost');
+      console.log('--- DB Check ---');
+      console.log('Type:', dialect.toUpperCase());
+      console.log('Host:', sequelize.config.host || 'localhost');
+      console.log('Port:', sequelize.config.port || (dialect === 'mysql' ? 3306 : 'default'));
+      console.log('User:', sequelize.config.username);
+      console.log('DB:', sequelize.config.database);
       console.log('---');
     }
+
+    await sequelize.authenticate();
+    console.log('Connected to database successfully.');
     // SQLite: allow alter (drop/recreate tables) by disabling FK checks during sync
     if (dialect === 'sqlite') {
       await sequelize.query('PRAGMA foreign_keys = OFF');
@@ -154,244 +169,206 @@ async function start() {
         }
       }
     }
-    // MySQL: skip alter to avoid "Too many keys" on tables that already have many indexes (e.g. users)
-    await sequelize.sync({ alter: dialect === 'sqlite' });
-
-    // Safe migration: ensure warehouse_id column exists in movements (for MySQL which skips alter)
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('movements');
-      if (!tableDescription.warehouse_id) {
-        await queryInterface.addColumn('movements', 'warehouse_id', {
-          type: require('sequelize').DataTypes.INTEGER,
-          allowNull: true,
-          defaultValue: null,
-        });
-        console.log('[Migration] Added warehouse_id column to movements table.');
-      }
-    } catch (migrationErr) {
-      console.warn('[Migration Warning] Could not add warehouse_id to movements:', migrationErr.message);
-    }
-
-    // Safe migration: ensure is_production column exists in warehouses
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('warehouses');
-      if (!tableDescription.is_production && !tableDescription.isProduction) {
-        console.log('[Migration] Column is_production not found, attempting to add...');
-        await queryInterface.addColumn('warehouses', 'is_production', {
-          type: require('sequelize').DataTypes.BOOLEAN,
-          allowNull: false,
-          defaultValue: false,
-        });
-        console.log('[Migration] Added is_production column to warehouses table.');
-      } else {
-        console.log('[Migration] is_production column already exists.');
-      }
-    } catch (migrationErr) {
-      console.error('[Migration Error] Critical failure adding is_production to warehouses:', migrationErr);
-    }
-
-    // Safe migration: ensure unit_of_measure column exists in products
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('products');
-      if (!tableDescription.unit_of_measure && !tableDescription.unitOfMeasure) {
-        console.log('[Migration] Column unit_of_measure not found in products, attempting to add...');
-        await queryInterface.addColumn('products', 'unit_of_measure', {
-          type: require('sequelize').DataTypes.STRING,
-          allowNull: true,
-          defaultValue: 'pcs',
-        });
-        console.log('[Migration] Added unit_of_measure column to products table.');
-      }
-    } catch (migrationErr) {
-      console.error('[Migration Error] Failure adding unit_of_measure to products:', migrationErr.message);
-    }
-
-    // Safe migration: ensure currency column exists in products
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('products');
-      if (!tableDescription.currency) {
-        console.log('[Migration] Column currency not found in products, attempting to add...');
-        await queryInterface.addColumn('products', 'currency', {
-          type: require('sequelize').DataTypes.STRING,
-          allowNull: true,
-          defaultValue: 'USD',
-        });
-        console.log('[Migration] Added currency column to products table.');
-      } else {
-        console.log('[Migration] currency column already exists in products.');
-      }
-    } catch (migrationErr) {
-      console.error('[Migration Error] Failure adding currency to products:', migrationErr.message);
-    }
-
-    // Safe migration: ensure new columns exist in production_orders
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('production_orders');
-      const newCols = [
-        { name: 'product_id', type: require('sequelize').DataTypes.INTEGER },
-        { name: 'formula_id', type: require('sequelize').DataTypes.INTEGER },
-        { name: 'production_area_id', type: require('sequelize').DataTypes.INTEGER },
-        { name: 'target_warehouse_id', type: require('sequelize').DataTypes.INTEGER },
-        { name: 'quantity_goal', type: require('sequelize').DataTypes.DECIMAL(12, 2), defaultValue: 0 },
-        { name: 'quantity_produced', type: require('sequelize').DataTypes.DECIMAL(12, 2), defaultValue: 0 },
-        { name: 'start_date', type: require('sequelize').DataTypes.DATE },
-        { name: 'completion_date', type: require('sequelize').DataTypes.DATE },
-        { name: 'status', type: require('sequelize').DataTypes.STRING, defaultValue: 'DRAFT' }
+    const syncOptions = { alter: dialect === 'sqlite' };
+    
+    // MySQL Manual Column Fixes helper
+    const applyManualFixes = async () => {
+      if (dialect !== 'mysql') return;
+      console.log('[DB] Applying manual column fixes...');
+      const manualCols = [
+        { t: 'inventory_adjustments', c: 'batch_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'inventory_adjustments', c: 'client_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'location_id', type: 'INT' },
+        { t: 'inventory_adjustments', c: 'best_before_date', type: 'DATE' },
+        { t: 'inventory_adjustments', c: 'created_by', type: 'INT' },
+        { t: 'inventory_logs', c: 'batch_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'inventory_logs', c: 'client_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'location_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'best_before_date', type: 'DATE' },
+        { t: 'inventory_logs', c: 'user_id', type: 'INT' },
+        { t: 'inventory_logs', c: 'reason', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'batch_id', type: 'INT' },
+        { t: 'product_stocks', c: 'client_id', type: 'INT' },
+        { t: 'product_stocks', c: 'location_id', type: 'INT' },
+        { t: 'product_stocks', c: 'batch_number', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'reason', type: 'VARCHAR(255)' },
+        { t: 'product_stocks', c: 'best_before_date', type: 'DATE' },
+        { t: 'product_stocks', c: 'user_id', type: 'INT' },
+        { t: 'categories', c: 'company_id', type: 'INT' },
+        { t: 'products', c: 'pack_size', type: 'INT DEFAULT 1' },
+        { t: 'products', c: 'color', type: 'VARCHAR(255)' },
+        { t: 'products', c: 'supplier_id', type: 'INT' },
+        { t: 'products', c: 'alternative_skus', type: 'LONGTEXT' },
+        { t: 'products', c: 'supplier_products', type: 'LONGTEXT' },
+        { t: 'products', c: 'price_lists', type: 'LONGTEXT' },
+        { t: 'products', c: 'cartons', type: 'LONGTEXT' },
+        { t: 'products', c: 'images', type: 'LONGTEXT' },
+        { t: 'products', c: 'marketplace_skus', type: 'LONGTEXT' },
+        { t: 'products', c: 'best_before_date_warning_period_days', type: 'INT DEFAULT 0' },
+        { t: 'purchase_orders', c: 'warehouse_id', type: 'INT' },
+        { t: 'purchase_orders', c: 'client_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'warehouse_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'delivery_type', type: 'VARCHAR(255)' },
+        { t: 'goods_receipts', c: 'eta', type: 'DATETIME' },
+        { t: 'goods_receipts', c: 'total_to_book', type: 'INT DEFAULT 0' },
+        { t: 'movements', c: 'from_warehouse_id', type: 'INT' },
+        { t: 'movements', c: 'to_warehouse_id', type: 'INT' },
+        { t: 'movements', c: 'from_location_id', type: 'INT' },
+        { t: 'movements', c: 'to_location_id', type: 'INT' },
+        { t: 'movements', c: 'batch_id', type: 'INT' },
+        { t: 'movements', c: 'company_id', type: 'INT' },
+        { t: 'movements', c: 'created_by', type: 'INT' },
+        { t: 'zones', c: 'warehouse_id', type: 'INT' },
+        { t: 'zones', c: 'company_id', type: 'INT' },
+        { t: 'locations', c: 'warehouse_id', type: 'INT' },
+        { t: 'locations', c: 'zone_id', type: 'INT' },
+        { t: 'locations', c: 'heat_sensitive', type: 'VARCHAR(255)' },
+        { t: 'users', c: 'company_id', type: 'INT' },
+        { t: 'users', c: 'warehouse_id', type: 'INT' },
+        { t: 'users', c: 'status', type: 'VARCHAR(50) DEFAULT "ACTIVE"' },
+        { t: 'supplier_products', c: 'effective_date', type: 'DATE' },
+        { t: 'goods_receipt_items', c: 'unit_cost', type: 'DECIMAL(12, 2)' },
+        { t: 'reports', c: 'content', type: 'LONGTEXT' },
+        { t: 'reports', c: 'last_run_at', type: 'DATETIME' },
+        { t: 'reports', c: 'report_name', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'report_type', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'category', type: 'VARCHAR(255)' },
+        { t: 'reports', c: 'start_date', type: 'DATE' },
+        { t: 'reports', c: 'end_date', type: 'DATE' },
+        { t: 'reports', c: 'format', type: 'VARCHAR(50)' },
+        { t: 'reports', c: 'schedule', type: 'VARCHAR(50)' },
+        { t: 'reports', c: 'status', type: 'VARCHAR(50)' },
+        { t: 'batches', c: 'grn_id', type: 'INT' },
+        { t: 'batches', c: 'client_id', type: 'INT' },
+        { t: 'batches', c: 'company_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'client_id', type: 'INT' },
+        { t: 'goods_receipts', c: 'company_id', type: 'INT' },
+        { t: 'product_stocks', c: 'company_id', type: 'INT' },
+        { t: 'audit_logs', c: 'client_id', type: 'INT' },
+        { t: 'companies', c: 'header_image_url', type: 'TEXT' },
+        { t: 'customers', c: 'header_image_url', type: 'TEXT' },
+        { t: 'suppliers', c: 'header_image_url', type: 'TEXT' },
       ];
-
-      for (const col of newCols) {
-        if (!tableDescription[col.name]) {
-          console.log(`[Migration] Adding ${col.name} to production_orders...`);
-          await queryInterface.addColumn('production_orders', col.name, {
-            type: col.type,
-            allowNull: true,
-            defaultValue: col.defaultValue || null
-          });
-        }
-      }
-    } catch (migrationErr) {
-      console.warn('[Migration Warning] Could not update production_orders (it might not exist yet):', migrationErr.message);
-    }
-
-    // Safe migration: ensure no order has NULL status and status is STRING
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('production_orders');
-
-      // If it's an enum or doesn't match STRING, we modify it
-      if (tableDescription.status && tableDescription.status.type.includes('ENUM')) {
-        console.log('[Migration] production_orders.status is ENUM, converting to VARCHAR(255)...');
-        await sequelize.query("ALTER TABLE production_orders MODIFY COLUMN status VARCHAR(255) DEFAULT 'DRAFT'");
-      }
-
-      await sequelize.query("UPDATE production_orders SET status = 'DRAFT' WHERE status IS NULL OR status = ''").catch(() => { });
-    } catch (err) {
-      console.warn('[Migration Warning] Could not safely modify production_orders.status:', err.message);
-    }
-
-    // Safe migration: ensure wastage_percentage in production_formula_items
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('production_formula_items');
-      if (!tableDescription.wastage_percentage) {
-        await queryInterface.addColumn('production_formula_items', 'wastage_percentage', {
-          type: require('sequelize').DataTypes.DECIMAL(5, 2),
-          allowNull: true,
-          defaultValue: 0
-        });
-        console.log('[Migration] Added wastage_percentage to production_formula_items.');
-      }
-    } catch (err) {
-      // ignore
-    }
-
-    // Safe migration: ensure warehouse_id and unit exist in production_order_items
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableDescription = await queryInterface.describeTable('production_order_items');
-      if (!tableDescription.warehouse_id) {
-        await queryInterface.addColumn('production_order_items', 'warehouse_id', {
-          type: require('sequelize').DataTypes.INTEGER,
-          allowNull: true
-        });
-      }
-      if (!tableDescription.unit) {
-        await queryInterface.addColumn('production_order_items', 'unit', {
-          type: require('sequelize').DataTypes.STRING,
-          allowNull: true
-        });
-      }
-      // Also ensure quantities are DECIMAL (might need fresh install or manual change for existings, but adding columns helps)
-    } catch (err) {
-      console.warn('[Migration Warning] Could not update production_order_items:', err.message);
-    }
-
-    // Safe migration: ensure quantities are DECIMAL across all tables
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const migrations = [
-        { table: 'product_stocks', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'product_stocks', col: 'reserved', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'inventory_adjustments', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'movements', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'order_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'purchase_order_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'batches', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'batches', col: 'reserved', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'pick_list_items', col: 'quantity_required', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'pick_list_items', col: 'quantity_picked', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-        { table: 'bundle_items', col: 'quantity', type: require('sequelize').DataTypes.DECIMAL(12, 3) },
-      ];
-
-      for (const m of migrations) {
+      for (const col of manualCols) {
         try {
-          const tableDesc = await queryInterface.describeTable(m.table);
-          if (tableDesc[m.col] && (tableDesc[m.col].type.includes('INT') || tableDesc[m.col].type.includes('INTEGER'))) {
-            console.log(`[Migration] Changing ${m.table}.${m.col} to DECIMAL(12,3)...`);
-            await queryInterface.changeColumn(m.table, m.col, {
-              type: m.type,
-              allowNull: true, // Allow true for flexibility during migration
-              defaultValue: 0
-            });
-          }
+          await sequelize.query(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.type} NULL`);
+          console.log(`[DB] Column ${col.t}.${col.c} added successfully`);
         } catch (err) {
-          console.warn(`[Migration Warning] Could not migrate ${m.table}.${m.col}:`, err.message);
+          if (!err.message.includes('Duplicate column') && !err.message.includes('Table') && !err.message.includes("doesn't exist")) {
+            console.warn(`[DB] Column ${col.t}.${col.c} error: ${err.message.slice(0, 60)}`);
+          }
         }
       }
-    } catch (err) {
-      console.error('[Migration Error] Failure during quantity decimal migration:', err.message);
-    }
-
-    // Safe migration: notifications table (if not handled by alter)
-    try {
-      const queryInterface = sequelize.getQueryInterface();
-      const tableExists = await queryInterface.showAllTables();
-      if (!tableExists.includes('notifications')) {
-        console.log('[Migration] Creating notifications table...');
-        await sequelize.query(`
-          CREATE TABLE IF NOT EXISTS notifications (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            company_id INT NOT NULL,
-            user_id INT NULL,
-            title VARCHAR(255) NOT NULL,
-            message TEXT NOT NULL,
-            type ENUM('info', 'warning', 'success', 'error') DEFAULT 'info',
-            priority ENUM('low', 'medium', 'high') DEFAULT 'medium',
-            is_read BOOLEAN DEFAULT FALSE,
-            link VARCHAR(255) NULL,
-            created_at DATETIME NOT NULL,
-            updated_at DATETIME NOT NULL
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        `);
+      const manualAlters = [
+        { t: 'goods_receipts', c: 'total_expected', type: 'DECIMAL(12, 3)' },
+        { t: 'goods_receipts', c: 'total_received', type: 'DECIMAL(12, 3)' },
+        { t: 'goods_receipts', c: 'total_to_book', type: 'DECIMAL(12, 3)' },
+        { t: 'goods_receipt_items', c: 'expected_qty', type: 'DECIMAL(12, 3)' },
+        { t: 'goods_receipt_items', c: 'received_qty', type: 'DECIMAL(12, 3)' },
+        { t: 'goods_receipt_items', c: 'qty_to_book', type: 'DECIMAL(12, 3)' },
+      ];
+      for (const col of manualAlters) {
+        try {
+          await sequelize.query(`ALTER TABLE ${col.t} MODIFY COLUMN ${col.c} ${col.type}`);
+          console.log(`[DB] Column ${col.t}.${col.c} altered to ${col.type}`);
+        } catch (err) {
+          // ignore if table/col doesn't exist yet, it will be created by sync
+        }
       }
-    } catch (err) {
-      console.warn('[Migration Warning] Could not create notifications table:', err.message);
+    };
+
+    if (dialect === 'mysql') {
+      let syncDone = false;
+      for (let attempt = 1; attempt <= 3 && !syncDone; attempt += 1) {
+        try {
+          // Pre-sync manual columns so unique indexes can be created
+          if (attempt === 1) await applyManualFixes(); 
+          
+          await sequelize.sync(syncOptions);
+          syncDone = true;
+        } catch (syncErr) {
+          console.warn(`[DB] Sync attempt ${attempt} failed: ${syncErr.message.slice(0, 100)}`);
+          
+          const brokenTable = getBrokenMySqlTableName(syncErr);
+          const isMissingCol = syncErr.message.includes("doesn't exist") || syncErr.original?.errno === 1072;
+
+          if (isMissingCol) {
+             console.log('[DB] Missing column detected, retrying manual fixes...');
+             await applyManualFixes();
+             continue;
+          }
+
+          if (!brokenTable || attempt === 3) {
+            throw syncErr;
+          }
+
+          console.warn(`[DB] Corrupted table metadata detected for "${brokenTable}". Attempting to drop and recreate.`);
+          try {
+            await sequelize.query('SET FOREIGN_KEY_CHECKS = 0');
+            await sequelize.query(`DROP TABLE IF EXISTS \`${brokenTable}\``);
+            await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
+            console.log(`[DB] Dropped broken table "${brokenTable}". Retrying sync (${attempt + 1}/3)...`);
+          } catch (dropErr) {
+            try {
+              await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
+            } catch (_) { /* ignore cleanup errors */ }
+            throw dropErr;
+          }
+        }
+      }
+    } else {
+      await sequelize.sync(syncOptions);
+    }
+    
+    console.log('Database synced successfully.');
+    // AUTO-SEED DEMO USERS if they don't exist (For 'Proper' Live Demo Experience)
+    const bcrypt = require('bcryptjs');
+    const { User, Company } = require('./models');
+
+    // Ensure at least one company exists for demo users
+    let defaultCompany = await Company.findByPk(1);
+    if (!defaultCompany) {
+      defaultCompany = await Company.create({
+        id: 1,
+        name: 'KIAAN WMS Demo',
+        code: 'KIAAN',
+        status: 'ACTIVE'
+      });
+      console.log('[SEED] Created default demo company');
     }
 
-    if (dialect === 'sqlite') {
-      await sequelize.query('PRAGMA foreign_keys = ON');
+    const demoUsers = [
+      { email: 'admin@kiaan-wms.com', password: 'Admin@123', name: 'Super Admin', role: 'super_admin' },
+      { email: 'companyadmin@kiaan-wms.com', password: '123456', name: 'Company Admin', role: 'company_admin' },
+      { email: 'inventorymanager@kiaan-wms.com', password: '123456', name: 'Inventory Manager', role: 'inventory_manager' },
+      { email: 'warehousemanager@kiaan-wms.com', password: '123456', name: 'Warehouse Manager', role: 'warehouse_manager' },
+      { email: 'piker@gmail.com', password: '123456', name: 'Picker', role: 'picker' },
+      { email: 'packer@gmail.com', password: '123456', name: 'Packer', role: 'packer' },
+    ];
+    for (const d of demoUsers) {
+      const exists = await User.findOne({ where: { email: d.email } });
+      if (!exists) {
+        const passwordHash = await bcrypt.hash(d.password, 10);
+        await User.create({
+          email: d.email,
+          passwordHash,
+          name: d.name,
+          role: d.role,
+          companyId: d.role === 'super_admin' ? null : 1, // Fallback to company 1
+          status: 'ACTIVE'
+        });
+        console.log(`[SEED] Created demo user: ${d.email}`);
+      }
     }
-    console.log('Database synced. IDs are now integers (1, 2, 3...).');
 
     // Initialize Cron AFTER database sync is complete
     cronService.init();
 
-    app.listen(PORT, async () => {
-      console.log(`Server is running on port ${PORT}`);
-
-      // Trigger initial low stock check for all active companies
-      const { Company } = require('./models');
-      const companies = await Company.findAll({ where: { status: 'ACTIVE' }, attributes: ['id'] });
-      for (const company of companies) {
-        notificationService.checkLowStockAndNotify(company.id).catch(err => {
-          console.error(`[Startup] Failed to check low stock for company ${company.id}:`, err.message);
-        });
-      }
+    app.listen(PORT, () => {
+      const liveUrl = process.env.NODE_ENV === 'production' ? 'https://wms-aksh-backend-production.up.railway.app' : `http://localhost:${PORT}`;
+      console.log(`WMS Backend running at ${liveUrl}`);
       console.log('Auth: POST /auth/login | GET /auth/me (Bearer token)');
       console.log('Super Admin: /api/superadmin/companies');
       console.log('Company: /api/company/profile');
@@ -408,11 +385,20 @@ async function start() {
     });
   } catch (err) {
     console.error('Unable to start server:', err);
-    const isConnectionRefused = err?.code === 'ECONNREFUSED' || err?.parent?.code === 'ECONNREFUSED' || err?.name === 'SequelizeConnectionRefusedError';
-    if (isConnectionRefused && (process.env.DB_DIALECT || 'sqlite') === 'mysql') {
-      console.error('\n--- MySQL connection refused ---');
-      console.error('Either: 1) Start MySQL (XAMPP/WAMP/MySQL service), or');
-      console.error('        2) Use SQLite: in .env set DB_DIALECT=sqlite (or remove DB_DIALECT) and restart.\n');
+    
+    const isConnErr = err?.code === 'ECONNREFUSED' || err?.parent?.code === 'ECONNREFUSED' || err?.code === 'ETIMEDOUT' || err?.parent?.code === 'ETIMEDOUT';
+    
+    if (isConnErr && (process.env.DB_DIALECT || 'sqlite') === 'mysql') {
+      console.error('\n--- Database Connection Error ---');
+      console.error('Details:', err.message);
+      console.error('\nHow to fix:');
+      console.log('1. Check if MySQL is running (Locally or on Cloud)');
+      console.log('2. If you are on Railway, make sure you have:');
+      console.log('   - Linked a MySQL service to this backend.');
+      console.log('   - Added "DB_DIALECT=mysql" in Railway Variables.');
+      console.log('   - Check if you need to use MYSQL_URL (Private Networking).');
+      console.log('3. Your current DB host was:', sequelize.config.host || 'localhost');
+      console.log('   (If this says "localhost" on Railway, it will NOT work!)\n');
     }
     process.exit(1);
   }

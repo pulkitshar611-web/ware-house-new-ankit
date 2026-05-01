@@ -45,7 +45,6 @@ async function create(data, reqUser) {
     address: data.address || null,
     phone: data.phone || null,
     capacity: data.capacity != null ? Number(data.capacity) : null,
-    isProduction: !!data.isProduction,
     status: data.status || 'ACTIVE',
   });
 }
@@ -61,7 +60,6 @@ async function update(id, data, reqUser) {
     address: data.address !== undefined ? data.address : wh.address,
     phone: data.phone !== undefined ? data.phone : wh.phone,
     capacity: data.capacity !== undefined ? (data.capacity != null ? Number(data.capacity) : null) : wh.capacity,
-    isProduction: data.isProduction !== undefined ? !!data.isProduction : wh.isProduction,
     status: data.status ?? wh.status,
   });
   return wh;
@@ -95,13 +93,48 @@ async function validateCapacity(warehouseId, incomingQty, options = {}) {
   return true;
 }
 
-async function getDefaultLocation(companyId) {
-  const wh = await Warehouse.findOne({ where: { companyId } });
-  if (!wh) return null;
-  const zone = await Zone.findOne({ where: { warehouseId: wh.id } });
-  if (!zone) return null;
-  const loc = await Location.findOne({ where: { zoneId: zone.id } });
-  return loc;
+async function getProducts(warehouseId, reqUser) {
+  const { Product, sequelize } = require('../models');
+  
+  // Base query for company
+  let companyId = reqUser.companyId;
+  const whereClause = ['p.company_id = :companyId'];
+  const replacements = { companyId, warehouseId };
+
+  // JSON query for MySQL as requested
+  // SELECT * FROM products WHERE JSON_EXTRACT(marketplace_skus, '$.warehouseId') = ?
+  whereClause.push("JSON_EXTRACT(p.marketplace_skus, '$.warehouseId') = :warehouseId");
+
+  const query = `
+    SELECT p.* 
+    FROM products p
+    WHERE ${whereClause.join(' AND ')}
+  `;
+
+  const products = await sequelize.query(query, {
+    replacements,
+    type: sequelize.QueryTypes.SELECT,
+    model: Product,
+    mapToModel: true
+  });
+
+  // Map to include quantity, available and status as requested
+  return products.map(p => {
+    const qty = 0; // Default as per Task 2
+    const available = qty;
+    const reorderLevel = p.reorderLevel || 10;
+    
+    let status = 'In Stock';
+    if (qty <= 0) status = 'Out of Stock';
+    else if (qty < reorderLevel) status = 'Low Stock';
+
+    return {
+      ...p.toJSON(),
+      quantity: qty,
+      availableQuantity: available,
+      status
+    };
+  });
 }
 
-module.exports = { list, getById, create, update, remove, validateCapacity, getDefaultLocation };
+module.exports = { list, getById, create, update, remove, validateCapacity, getProducts };

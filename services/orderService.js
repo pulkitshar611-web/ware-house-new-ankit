@@ -1,5 +1,6 @@
-const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment } = require('../models');
+const { SalesOrder, OrderItem, Product, Customer, Company, PickList, PickListItem, PackingTask, Warehouse, Shipment, sequelize } = require('../models');
 const { Op } = require('sequelize');
+const inventoryService = require('./inventoryService');
 
 async function list(reqUser, query = {}) {
   const where = {};
@@ -14,8 +15,9 @@ async function list(reqUser, query = {}) {
     order: [['createdAt', 'DESC']],
     include: [
       { association: 'Company', attributes: ['id', 'name', 'code'] },
-      { association: 'Customer', attributes: ['id', 'name', 'email', 'address', 'city', 'state', 'country', 'postcode'] },
+      { association: 'Client', attributes: ['id', 'name', 'email', 'address', 'city', 'state', 'country', 'postcode'] },
       { association: 'OrderItems', include: [{ association: 'Product', attributes: ['id', 'name', 'sku', 'weight', 'weightUnit'] }] },
+      { association: 'PickLists', include: [{ association: 'PickListItems', include: [{ association: 'Location' }] }] },
       { association: 'Shipment' },
     ],
   });
@@ -26,7 +28,7 @@ async function getById(id, reqUser) {
   const order = await SalesOrder.findByPk(id, {
     include: [
       { association: 'Company' },
-      { association: 'Customer' },
+      { association: 'Client' },
       { association: 'OrderItems', include: ['Product'] },
       { association: 'PickLists', include: ['PickListItems', 'Warehouse', 'User'] },
       { association: 'PackingTasks', include: ['User'] },
@@ -41,125 +43,250 @@ async function getById(id, reqUser) {
 async function create(data, reqUser) {
   if (reqUser.role !== 'super_admin' && reqUser.role !== 'company_admin') throw new Error('Only Company Admin can create sales orders');
   const companyId = reqUser.companyId;
-  const count = await SalesOrder.count({ where: { companyId } });
-  const orderNumber = `ORD-${Date.now()}-${String(count + 1).padStart(4, '0')}`;
-  const order = await SalesOrder.create({
-    companyId,
-    orderNumber,
-    customerId: data.customerId || null,
-    orderDate: data.orderDate || null,
-    requiredDate: data.requiredDate || null,
-    priority: data.priority || 'MEDIUM',
-    salesChannel: data.salesChannel || 'DIRECT',
-    orderType: data.orderType || null,
-    referenceNumber: data.referenceNumber || null,
-    notes: data.notes || null,
-    status: 'DRAFT',
-    totalAmount: 0,
-    createdBy: reqUser.id,
-  });
-  let total = 0;
-  if (data.items && data.items.length) {
-    for (const row of data.items) {
-      const product = await Product.findByPk(row.productId);
-      if (!product || product.companyId !== companyId) continue;
-      const unitPrice = row.unitPrice ?? product.price;
-      const qty = row.quantity || 1;
-      await OrderItem.create({
+
+  const t = await sequelize.transaction();
+  try {
+    const count = await SalesOrder.count({ where: { companyId }, transaction: t });
+    const orderNumber = `ORD-${Date.now()}-${String(count + 1).padStart(4, '0')}`;
+    
+    const order = await SalesOrder.create({
+      companyId,
+      orderNumber,
+      customerId: data.customerId || null,
+      orderDate: data.orderDate || null,
+      requiredDate: data.requiredDate || null,
+      priority: data.priority || 'MEDIUM',
+      salesChannel: data.salesChannel || 'DIRECT',
+      orderType: data.orderType || null,
+      referenceNumber: data.referenceNumber || null,
+      notes: data.notes || null,
+      status: 'DRAFT',
+      totalAmount: 0,
+      createdBy: reqUser.id,
+    }, { transaction: t });
+
+    let total = 0;
+    const warehouse = await Warehouse.findOne({ where: { companyId }, transaction: t });
+
+    if (data.items && data.items.length) {
+      for (const row of data.items) {
+        const product = await Product.findByPk(row.productId, { transaction: t });
+        if (!product || product.companyId !== companyId) continue;
+        
+        const unitPrice = row.unitPrice ?? product.price;
+        const qty = row.quantity || 1;
+        
+        await OrderItem.create({
+          salesOrderId: order.id,
+          productId: product.id,
+          quantity: qty,
+          unitPrice: unitPrice,
+        }, { transaction: t });
+        
+        total += Number(unitPrice) * qty;
+
+        // RESERVE STOCK
+        // Instead of using a fixed warehouse for the whole order, 
+        // we try to find where the stock is for this specific product.
+        let targetWarehouseId = warehouse?.id;
+        
+        // Check if stock exists in the "default" warehouse first
+        const hasStockInDefault = warehouse ? await ProductStock.findOne({
+          where: { productId: product.id, warehouseId: warehouse.id, companyId, clientId: data.customerId || null, quantity: { [Op.gt]: sequelize.col('reserved') } },
+          transaction: t
+        }) : null;
+
+        if (!hasStockInDefault) {
+          // If not in default, look for ANY warehouse with available stock
+          const otherWh = await ProductStock.findOne({
+            where: { productId: product.id, companyId, clientId: data.customerId || null, quantity: { [Op.gt]: sequelize.col('reserved') } },
+            transaction: t
+          });
+          if (otherWh) targetWarehouseId = otherWh.warehouseId;
+        }
+
+        if (targetWarehouseId) {
+          await inventoryService.reserveStock({
+            productId: product.id,
+            companyId,
+            warehouseId: targetWarehouseId,
+            clientId: data.customerId || null,
+            quantity: qty
+          }, t);
+        } else {
+          throw new Error(`Insufficient available stock for product ${product.sku} across all warehouses.`);
+        }
+      }
+      await order.update({ totalAmount: total }, { transaction: t });
+    }
+
+    if (warehouse && data.items?.length) {
+      const pickList = await PickList.create({
         salesOrderId: order.id,
-        productId: product.id,
-        quantity: qty,
-        unitPrice: unitPrice,
-      });
-      total += Number(unitPrice) * qty;
-    }
-    await order.update({ totalAmount: total, status: 'DRAFT' });
-  }
-  const warehouse = await Warehouse.findOne({ where: { companyId } });
-  if (warehouse && data.items?.length) {
-    const pickList = await PickList.create({
-      salesOrderId: order.id,
-      warehouseId: warehouse.id,
-      status: 'NOT_STARTED',
-    });
-    for (const row of data.items) {
-      await PickListItem.create({
+        warehouseId: warehouse.id,
+        status: 'NOT_STARTED',
+      }, { transaction: t });
+
+      for (const row of data.items) {
+        await PickListItem.create({
+          pickListId: pickList.id,
+          productId: row.productId,
+          quantityRequired: row.quantity || 1,
+          quantityPicked: 0,
+        }, { transaction: t });
+      }
+
+      await order.update({ status: 'CONFIRMED' }, { transaction: t });
+      await PackingTask.create({
+        salesOrderId: order.id,
         pickListId: pickList.id,
-        productId: row.productId,
-        quantityRequired: row.quantity || 1,
-        quantityPicked: 0,
-      });
+        status: 'NOT_STARTED',
+      }, { transaction: t });
     }
-    await order.update({ status: 'CONFIRMED' });
-    await PackingTask.create({
-      salesOrderId: order.id,
-      pickListId: pickList.id,
-      status: 'NOT_STARTED',
-    });
+
+    await t.commit();
+    return getById(order.id, reqUser);
+  } catch (err) {
+    await t.rollback();
+    throw err;
   }
-  return getById(order.id, reqUser);
 }
 
 async function update(id, data, reqUser) {
-  const order = await SalesOrder.findByPk(id);
-  if (!order) throw new Error('Order not found');
-  if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
-  const allowedStatuses = ['DRAFT', 'CONFIRMED'];
-  if (!allowedStatuses.includes((order.status || '').toUpperCase())) {
-    throw new Error('Only DRAFT or CONFIRMED orders can be edited');
-  }
-  await order.update({
-    customerId: data.customerId !== undefined ? data.customerId : order.customerId,
-    orderDate: data.orderDate !== undefined ? data.orderDate : order.orderDate,
-    requiredDate: data.requiredDate !== undefined ? data.requiredDate : order.requiredDate,
-    priority: data.priority !== undefined ? data.priority : order.priority,
-    salesChannel: data.salesChannel !== undefined ? data.salesChannel : order.salesChannel,
-    orderType: data.orderType !== undefined ? data.orderType : order.orderType,
-    referenceNumber: data.referenceNumber !== undefined ? data.referenceNumber : order.referenceNumber,
-    notes: data.notes !== undefined ? data.notes : order.notes,
-  });
-  if (data.items && Array.isArray(data.items)) {
-    await OrderItem.destroy({ where: { salesOrderId: order.id } });
-    let total = 0;
-    for (const row of data.items) {
-      const product = await Product.findByPk(row.productId);
-      if (!product || product.companyId !== order.companyId) continue;
-      const unitPrice = row.unitPrice ?? product.price;
-      const qty = row.quantity || 1;
-      await OrderItem.create({
-        salesOrderId: order.id,
-        productId: product.id,
-        quantity: qty,
-        unitPrice: unitPrice,
-      });
-      total += Number(unitPrice) * qty;
+  const t = await sequelize.transaction();
+  try {
+    const order = await SalesOrder.findByPk(id, {
+      include: [{ association: 'OrderItems' }, { association: 'PickLists' }],
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+    if (!order) throw new Error('Order not found');
+    if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
+    
+    const allowedStatuses = ['DRAFT', 'CONFIRMED'];
+    if (!allowedStatuses.includes((order.status || '').toUpperCase())) {
+      throw new Error('Only DRAFT or CONFIRMED orders can be edited');
     }
-    await order.update({ totalAmount: total });
+
+    // 1. Unreserve OLD items (if a warehouse was assigned)
+    const warehouseId = order.PickLists?.[0]?.warehouseId;
+    if (warehouseId && order.OrderItems) {
+      for (const item of order.OrderItems) {
+        await inventoryService.unreserveStock({
+          productId: item.productId,
+          companyId: order.companyId,
+          warehouseId,
+          clientId: order.customerId || null,
+          quantity: item.quantity
+        }, t);
+      }
+    }
+
+    // 2. Update Order Details
+    await order.update({
+      customerId: data.customerId !== undefined ? data.customerId : order.customerId,
+      orderDate: data.orderDate !== undefined ? data.orderDate : order.orderDate,
+      requiredDate: data.requiredDate !== undefined ? data.requiredDate : order.requiredDate,
+      priority: data.priority !== undefined ? data.priority : order.priority,
+      salesChannel: data.salesChannel !== undefined ? data.salesChannel : order.salesChannel,
+      orderType: data.orderType !== undefined ? data.orderType : order.orderType,
+      referenceNumber: data.referenceNumber !== undefined ? data.referenceNumber : order.referenceNumber,
+      notes: data.notes !== undefined ? data.notes : order.notes,
+    }, { transaction: t });
+
+    // 3. Update Items & Reserve NEW ones
+    if (data.items && Array.isArray(data.items)) {
+      await OrderItem.destroy({ where: { salesOrderId: order.id }, transaction: t });
+      let total = 0;
+      
+      const currentWarehouse = await Warehouse.findOne({ where: { companyId: order.companyId }, transaction: t });
+      
+      for (const row of data.items) {
+        const product = await Product.findByPk(row.productId, { transaction: t });
+        if (!product || product.companyId !== order.companyId) continue;
+        
+        const unitPrice = row.unitPrice ?? product.price;
+        const qty = row.quantity || 1;
+        
+        await OrderItem.create({
+          salesOrderId: order.id,
+          productId: product.id,
+          quantity: qty,
+          unitPrice: unitPrice,
+        }, { transaction: t });
+        
+        total += Number(unitPrice) * qty;
+
+        // Re-reserve
+        if (currentWarehouse) {
+          await inventoryService.reserveStock({
+            productId: product.id,
+            companyId: order.companyId,
+            warehouseId: currentWarehouse.id,
+            clientId: order.customerId || null,
+            quantity: qty
+          }, t);
+        }
+      }
+      await order.update({ totalAmount: total }, { transaction: t });
+    }
+
+    await t.commit();
+    return getById(order.id, reqUser);
+  } catch (err) {
+    await t.rollback();
+    throw err;
   }
-  return getById(order.id, reqUser);
 }
 
 async function remove(id, reqUser) {
-  const order = await SalesOrder.findByPk(id);
-  if (!order) throw new Error('Order not found');
-  if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
-  const allowedStatuses = ['DRAFT', 'CONFIRMED', 'PICK_LIST_CREATED'];
-  const status = (order.status || '').toUpperCase();
-  if (!allowedStatuses.includes(status)) {
-    throw new Error(`This sales order cannot be deleted. Current status: ${status || 'Unknown'}. Only Draft, Confirmed or Pick list created orders can be deleted.`);
+  const t = await sequelize.transaction();
+  try {
+    const order = await SalesOrder.findByPk(id, {
+      include: [{ association: 'OrderItems' }, { association: 'PickLists' }],
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+    if (!order) throw new Error('Order not found');
+    if (reqUser.role !== 'super_admin' && order.companyId !== reqUser.companyId) throw new Error('Order not found');
+    
+    const allowedStatuses = ['DRAFT', 'CONFIRMED', 'PICK_LIST_CREATED'];
+    const status = (order.status || '').toUpperCase();
+    if (!allowedStatuses.includes(status)) {
+      throw new Error(`This sales order cannot be deleted. Current status: ${status || 'Unknown'}. Only Draft, Confirmed or Pick list created orders can be deleted.`);
+    }
+
+    // UNRESERVE STOCK
+    const warehouseId = order.PickLists?.[0]?.warehouseId;
+    if (warehouseId && order.OrderItems) {
+      for (const item of order.OrderItems) {
+        await inventoryService.unreserveStock({
+          productId: item.productId,
+          companyId: order.companyId,
+          warehouseId,
+          clientId: order.customerId || null,
+          quantity: item.quantity
+        }, t);
+      }
+    }
+
+    await OrderItem.destroy({ where: { salesOrderId: order.id }, transaction: t });
+    const pickLists = await PickList.findAll({ where: { salesOrderId: order.id }, transaction: t });
+    for (const pl of pickLists) {
+      await PickListItem.destroy({ where: { pickListId: pl.id }, transaction: t });
+      await PackingTask.destroy({ where: { pickListId: pl.id }, transaction: t });
+      await pl.destroy({ transaction: t });
+    }
+    await PackingTask.destroy({ where: { salesOrderId: order.id }, transaction: t });
+    await Shipment.destroy({ where: { salesOrderId: order.id }, transaction: t });
+    await order.destroy({ transaction: t });
+
+    await t.commit();
+    return { message: 'Order deleted and stock unreserved' };
+  } catch (err) {
+    await t.rollback();
+    throw err;
   }
-  const { PickList, PickListItem, PackingTask, Shipment } = require('../models');
-  await OrderItem.destroy({ where: { salesOrderId: order.id } });
-  const pickLists = await PickList.findAll({ where: { salesOrderId: order.id } });
-  for (const pl of pickLists) {
-    await PickListItem.destroy({ where: { pickListId: pl.id } });
-    await PackingTask.destroy({ where: { pickListId: pl.id } });
-    await pl.destroy();
-  }
-  await PackingTask.destroy({ where: { salesOrderId: order.id } });
-  await Shipment.destroy({ where: { salesOrderId: order.id } });
-  await order.destroy();
-  return { message: 'Order deleted' };
 }
 
 module.exports = { list, getById, create, update, remove };

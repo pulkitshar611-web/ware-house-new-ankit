@@ -3,7 +3,6 @@ const router = express.Router();
 const authRoutes = require('./auth');
 const superadminRoutes = require('../modules/superadmin/routes');
 const superadminController = require('../controllers/superadminController');
-const notificationController = require('../controllers/notificationController');
 const { authenticate, requireSuperAdmin, requireRole } = require('../middlewares/auth');
 const companyRoutes = require('../modules/company/routes');
 const userRoutes = require('../modules/users/routes');
@@ -11,6 +10,7 @@ const warehouseRoutes = require('./warehouses');
 const zoneRoutes = require('./zones');
 const locationRoutes = require('./locations');
 const supplierRoutes = require('./suppliers');
+const supplierProductRoutes = require('./supplierProducts');
 const bundleRoutes = require('./bundles');
 const inventoryRoutes = require('../modules/inventory/routes');
 const orderRoutes = require('../modules/orders/routes');
@@ -26,6 +26,7 @@ const labelsController = require('../controllers/labelsController');
 const searchController = require('../controllers/searchController');
 
 router.use('/auth', authRoutes);
+router.use('/api/auth', authRoutes); // Add /api prefix for consistency
 const searchRoles = ['super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'viewer', 'picker', 'packer'];
 router.get('/api/search', authenticate, requireRole(...searchRoles), searchController.search);
 router.get('/api/labels', authenticate, requireRole('super_admin', 'company_admin', 'warehouse_manager', 'inventory_manager', 'packer', 'viewer'), labelsController.list);
@@ -39,6 +40,7 @@ router.use('/api/warehouses', warehouseRoutes);
 router.use('/api/zones', zoneRoutes);
 router.use('/api/locations', locationRoutes);
 router.use('/api/suppliers', supplierRoutes);
+router.use('/api/supplier-products', supplierProductRoutes);
 router.use('/api/bundles', bundleRoutes);
 router.use('/api/inventory', inventoryRoutes);
 router.use('/api/orders', orderRoutes);
@@ -50,10 +52,28 @@ router.use('/api/goods-receiving', goodsReceivingRoutes);
 router.use('/api/replenishment', replenishmentRoutes);
 router.use('/api/returns', returnRoutes);
 router.use('/api/vat-codes', vatCodeRoutes);
-
-// Notifications
-router.get('/api/notifications', authenticate, notificationController.list);
-router.put('/api/notifications/:id/read', authenticate, notificationController.markAsRead);
-router.put('/api/notifications/read-all', authenticate, notificationController.markAllAsRead);
+const multer = require('multer');
+const path = require('path');
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.join(__dirname, '../uploads')),
+  filename: (req, file, cb) => cb(null, `logo-${Date.now()}${path.extname(file.originalname)}`),
+});
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    const filetypes = /jpeg|jpg|png|gif/;
+    const mimetype = filetypes.test(file.mimetype);
+    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+    if (mimetype && extname) return cb(null, true);
+    cb(new Error('Only image files (jpg, jpeg, png, gif) are allowed!'));
+  }
+});
+router.post('/api/upload', authenticate, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
+  res.json({ success: true, data: { url: fileUrl } });
+});
 
 module.exports = router;
